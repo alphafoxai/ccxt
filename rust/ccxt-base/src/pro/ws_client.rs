@@ -19,11 +19,15 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::Value;
@@ -44,6 +48,8 @@ pub struct ClientState {
     connect_gate: tokio::sync::Mutex<()>,
     /// Parsed inbound messages awaiting dispatch to `handle_message`.
     incoming: Mutex<VecDeque<Value>>,
+    /// Taken from `NEXT_GENERATION` at construction.
+    generation: u64,
     /// Woken on: new inbound message, a resolve/reject, or close.
     notify: Notify,
     /// messageHash → resolved value (set by `handle_message` via `resolve`).
@@ -86,8 +92,63 @@ struct FlightSlot {
     settled: Option<Result<Value, Value>>,
 }
 
+/// Capacity of the bounded reader-boundary raw handoff, per URL.
+const RAW_BUS_CAPACITY: usize = 256;
+
+/// Monotonic generation counter. Each `ClientState` takes one, so a reconnect that
+/// replaces a URL socket also replaces its generation, which lets an observer tell
+/// frames from a dead socket apart from frames of the live one.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 static REGISTRY: Lazy<Mutex<HashMap<String, Arc<ClientState>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// One inbound WebSocket message as it arrived at the CCXT reader boundary.
+///
+/// The parsed `Value` the drive loop consumes deliberately drops venue fields — a
+/// Binance kline loses `x`/`q`/`E`/`T` — so this handoff carries the original bytes
+/// plus the reader-side ingress instants. It is an observation channel beside the
+/// parsed queue, never a replacement for it: the reader still feeds `incoming` and
+/// the drive loop stays the only consumer of the parsed messages.
+#[derive(Clone, Debug)]
+pub struct RawFrame {
+    /// URL slot the frame arrived on.
+    pub url: String,
+    /// Generation of the socket that delivered the frame. Compare it with the live
+    /// generation to discard frames from a socket that has already been replaced.
+    pub generation: u64,
+    /// Reader-side monotonic instant, taken before parsing.
+    pub ingress_at: Instant,
+    /// Reader-side wall-clock milliseconds for the same instant.
+    pub ingress_unix_ms: i64,
+    /// Whether the frame arrived as a binary WebSocket message.
+    pub is_binary: bool,
+    /// Original payload bytes, unconverted.
+    pub payload: Vec<u8>,
+}
+
+/// Per-URL bounded raw handoff. It lives beside the client registry rather than
+/// inside a `ClientState` so that a reconnect replacing the socket for a URL cannot
+/// silently detach an observer.
+struct RawBus {
+    sender: broadcast::Sender<RawFrame>,
+    overflow: AtomicU64,
+}
+
+static RAW_BUS: Lazy<Mutex<HashMap<String, Arc<RawBus>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn raw_bus(url: &str) -> Arc<RawBus> {
+    let mut bus = RAW_BUS.lock().unwrap();
+    bus.entry(url.to_string())
+        .or_insert_with(|| {
+            Arc::new(RawBus {
+                sender: broadcast::channel(RAW_BUS_CAPACITY).0,
+                overflow: AtomicU64::new(0),
+            })
+        })
+        .clone()
+}
 
 /// Monotonic-ish wall clock in ms. `SystemTime` is fine here (keep-alive only).
 fn now_ms() -> i64 {
@@ -137,6 +198,35 @@ fn parse_binary(b: &[u8]) -> Value {
 }
 
 impl ClientState {
+    /// Publish raw bytes to the URL bounded handoff before the parsed value is
+    /// queued. Never blocks the reader: a full channel drops the frame and increments
+    /// the URL overflow counter for an observer to notice.
+    fn observe_raw(
+        &self,
+        payload: Vec<u8>,
+        is_binary: bool,
+        ingress_at: Instant,
+        ingress_unix_ms: i64,
+    ) {
+        let bus = raw_bus(&self.url);
+        if bus.sender.len() >= RAW_BUS_CAPACITY {
+            bus.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = bus.sender.send(RawFrame {
+            url: self.url.clone(),
+            generation: self.generation,
+            ingress_at,
+            ingress_unix_ms,
+            is_binary,
+            payload,
+        });
+    }
+
+    /// Generation of this socket.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn push_incoming(&self, v: Value) {
         self.incoming.lock().unwrap().push_back(v);
         self.notify.notify_waiters();
@@ -327,6 +417,21 @@ impl ClientState {
         self.incoming.lock().unwrap().push_back(msg);
         self.notify.notify_one();
     }
+
+    /// Inject a raw fixture through both the raw handoff and the drive queue, which is
+    /// what the socket reader does for a real frame. Socket-less tests use this;
+    /// production paths never call it.
+    pub fn mock_inject_raw(&self, payload: Vec<u8>, is_binary: bool) {
+        let ingress_at = Instant::now();
+        self.observe_raw(payload.clone(), is_binary, ingress_at, now_ms());
+        let message = if is_binary {
+            parse_binary(&payload)
+        } else {
+            parse_text(std::str::from_utf8(&payload).unwrap_or_default())
+        };
+        self.incoming.lock().unwrap().push_back(message);
+        self.notify.notify_one();
+    }
     pub fn is_mock(&self) -> bool { *self.mock.lock().unwrap() }
     /// The captured outgoing frames as a `Value::List`.
     pub fn mock_sent_value(&self) -> Value {
@@ -429,6 +534,30 @@ impl ClientState {
 pub fn get_client(url: &str) -> Option<Arc<ClientState>> {
     let reg = REGISTRY.lock().unwrap();
     reg.get(url).filter(|c| !c.is_closed()).cloned()
+}
+
+/// Attach a raw observer to `url`.
+///
+/// The channel lives per URL and outlives individual sockets, so calling this before
+/// the first `watch*` call attaches the observer before the reader can deliver the
+/// first frame, and a later reconnect does not detach it.
+pub fn subscribe_raw(url: &str) -> broadcast::Receiver<RawFrame> {
+    raw_bus(url).sender.subscribe()
+}
+
+/// Frames dropped on `url` because the bounded handoff was full. A lagging receiver
+/// also observes `broadcast::error::RecvError::Lagged`, so a dropped frame is either
+/// counted here or reported to the receiver, never silently lost.
+pub fn raw_overflow_count(url: &str) -> u64 {
+    let bus = RAW_BUS.lock().unwrap();
+    bus.get(url)
+        .map(|bus| bus.overflow.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Generation of the live `url` socket, if one exists.
+pub fn client_generation(url: &str) -> Option<u64> {
+    get_client(url).map(|client| client.generation())
 }
 
 /// `client.subscriptions[key] = val` written on a tagged snapshot — persist it
@@ -544,8 +673,16 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
     tokio::spawn(async move {
         while let Some(frame) = read.next().await {
             match frame {
-                Ok(Message::Text(t)) => st.push_incoming(parse_text(&t)),
-                Ok(Message::Binary(b)) => st.push_incoming(parse_binary(&b)),
+                Ok(Message::Text(t)) => {
+                    let ingress_at = Instant::now();
+                    st.observe_raw(t.to_string().into_bytes(), false, ingress_at, now_ms());
+                    st.push_incoming(parse_text(&t));
+                }
+                Ok(Message::Binary(b)) => {
+                    let ingress_at = Instant::now();
+                    st.observe_raw(b.to_vec(), true, ingress_at, now_ms());
+                    st.push_incoming(parse_binary(&b));
+                }
                 Ok(Message::Pong(_)) => st.on_pong(),
                 // tungstenite answers Ping frames with Pong automatically.
                 Ok(Message::Ping(_)) => {}
@@ -606,6 +743,7 @@ fn ensure_slot(url: &str) -> Arc<ClientState> {
         pending_rx: Mutex::new(Some(rx)),
         connect_gate: tokio::sync::Mutex::new(()),
         incoming: Mutex::new(VecDeque::new()),
+        generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         notify: Notify::new(),
         resolved: Mutex::new(HashMap::new()),
         rejections: Mutex::new(HashMap::new()),
