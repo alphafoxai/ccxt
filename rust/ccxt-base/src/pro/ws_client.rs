@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Instant;
@@ -138,6 +138,41 @@ struct RawBus {
 static RAW_BUS: Lazy<Mutex<HashMap<String, Arc<RawBus>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Capacity of the bounded global raw handoff. See `subscribe_raw_all`.
+const RAW_ALL_CAPACITY: usize = 4096;
+
+/// The global handoff is created on first use, so a process that never asks for it
+/// pays one relaxed atomic load per frame and nothing else.
+struct RawAllBus {
+    sender: broadcast::Sender<RawFrame>,
+    overflow: AtomicU64,
+}
+
+static RAW_ALL_OPEN: AtomicBool = AtomicBool::new(false);
+
+static RAW_ALL_BUS: Lazy<Mutex<Option<Arc<RawAllBus>>>> = Lazy::new(|| Mutex::new(None));
+
+fn raw_all_bus() -> Arc<RawAllBus> {
+    let mut slot = RAW_ALL_BUS.lock().unwrap();
+    let bus = slot.get_or_insert_with(|| {
+        Arc::new(RawAllBus {
+            sender: broadcast::channel(RAW_ALL_CAPACITY).0,
+            overflow: AtomicU64::new(0),
+        })
+    });
+    // Published after the sender exists, so a reader that observes `true` always
+    // finds a bus.
+    RAW_ALL_OPEN.store(true, Ordering::Release);
+    Arc::clone(bus)
+}
+
+fn raw_all_bus_if_open() -> Option<Arc<RawAllBus>> {
+    if !RAW_ALL_OPEN.load(Ordering::Acquire) {
+        return None;
+    }
+    RAW_ALL_BUS.lock().unwrap().clone()
+}
+
 fn raw_bus(url: &str) -> Arc<RawBus> {
     let mut bus = RAW_BUS.lock().unwrap();
     bus.entry(url.to_string())
@@ -212,14 +247,24 @@ impl ClientState {
         if bus.sender.len() >= RAW_BUS_CAPACITY {
             bus.overflow.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = bus.sender.send(RawFrame {
+        let frame = RawFrame {
             url: self.url.clone(),
             generation: self.generation,
             ingress_at,
             ingress_unix_ms,
             is_binary,
             payload,
-        });
+        };
+        let _ = bus.sender.send(frame.clone());
+        // The global handoff is a second, deliberately broader tap: a caller that does
+        // not know which URL the venue will derive for a subscription can still
+        // observe the socket. It is bounded and counted the same way.
+        if let Some(all) = raw_all_bus_if_open() {
+            if all.sender.len() >= RAW_ALL_CAPACITY {
+                all.overflow.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = all.sender.send(frame);
+        }
     }
 
     /// Generation of this socket.
@@ -551,6 +596,34 @@ pub fn subscribe_raw(url: &str) -> broadcast::Receiver<RawFrame> {
 pub fn raw_overflow_count(url: &str) -> u64 {
     let bus = RAW_BUS.lock().unwrap();
     bus.get(url)
+        .map(|bus| bus.overflow.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Attach a raw observer to **every** socket this process opens.
+///
+/// The per-URL handoff requires the caller to know the URL, but the venue derives it
+/// inside the watch call -- a configured base plus a per-subscription stream index the
+/// venue allocates and records for itself. This handoff removes that requirement: a
+/// caller subscribes before calling `watch*` and reads the URL from the frames, which
+/// is what a collector needs when the venue owns the socket layout.
+///
+/// It is broader by construction, so a subscriber must discriminate: frames carry the
+/// URL and generation, and a session that already knows its URL should reject the rest
+/// rather than trust the channel.
+pub fn subscribe_raw_all() -> broadcast::Receiver<RawFrame> {
+    raw_all_bus().sender.subscribe()
+}
+
+/// Frames dropped on the global handoff because it was full.
+pub fn raw_all_overflow_count() -> u64 {
+    if !RAW_ALL_OPEN.load(Ordering::Acquire) {
+        return 0;
+    }
+    RAW_ALL_BUS
+        .lock()
+        .unwrap()
+        .as_ref()
         .map(|bus| bus.overflow.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
