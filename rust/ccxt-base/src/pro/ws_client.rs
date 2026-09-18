@@ -138,6 +138,14 @@ struct RawBus {
 static RAW_BUS: Lazy<Mutex<HashMap<String, Arc<RawBus>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// A single bounded discovery bus, independent of URL registration. An observer
+// can attach before watch derives a URL; frames retain their exact URL and
+// generation so the caller can enforce its own venue/environment boundary.
+static RAW_ALL_BUS: Lazy<RawBus> = Lazy::new(|| RawBus {
+    sender: broadcast::channel(RAW_BUS_CAPACITY).0,
+    overflow: AtomicU64::new(0),
+});
+
 fn raw_bus(url: &str) -> Arc<RawBus> {
     let mut bus = RAW_BUS.lock().unwrap();
     bus.entry(url.to_string())
@@ -212,14 +220,21 @@ impl ClientState {
         if bus.sender.len() >= RAW_BUS_CAPACITY {
             bus.overflow.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = bus.sender.send(RawFrame {
+        let frame = RawFrame {
             url: self.url.clone(),
             generation: self.generation,
             ingress_at,
             ingress_unix_ms,
             is_binary,
             payload,
-        });
+        };
+        if RAW_ALL_BUS.sender.receiver_count() != 0 {
+            if RAW_ALL_BUS.sender.len() >= RAW_BUS_CAPACITY {
+                RAW_ALL_BUS.overflow.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = RAW_ALL_BUS.sender.send(frame.clone());
+        }
+        let _ = bus.sender.send(frame);
     }
 
     /// Generation of this socket.
@@ -250,7 +265,10 @@ impl ClientState {
                 // If nothing arrives within a short window the fixture is
                 // finished (or under-feeds this watch) — stop instead of
                 // blocking the drive loop forever, so the test completes.
-                if tokio::time::timeout(std::time::Duration::from_millis(1500), notified).await.is_err() {
+                if tokio::time::timeout(std::time::Duration::from_millis(1500), notified)
+                    .await
+                    .is_err()
+                {
                     return None;
                 }
             } else {
@@ -267,7 +285,10 @@ impl ClientState {
     /// waiter that exists will read its side.
     pub fn resolve(&self, hash: &str, value: Value) {
         self.flight_settle(hash, Ok(value.clone()));
-        self.resolved.lock().unwrap().insert(hash.to_string(), value);
+        self.resolved
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), value);
         self.notify.notify_waiters();
     }
 
@@ -275,7 +296,10 @@ impl ClientState {
     /// single-flight on the same hash — see `resolve`.
     pub fn reject(&self, hash: &str, err: Value) {
         self.flight_settle(hash, Err(err.clone()));
-        self.rejections.lock().unwrap().insert(hash.to_string(), err);
+        self.rejections
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), err);
         self.notify.notify_waiters();
     }
 
@@ -329,7 +353,13 @@ impl ClientState {
                 true
             }
             None => {
-                fl.insert(hash.to_string(), FlightSlot { open: true, settled: None });
+                fl.insert(
+                    hash.to_string(),
+                    FlightSlot {
+                        open: true,
+                        settled: None,
+                    },
+                );
                 self.futures.lock().unwrap().insert(hash.to_string());
                 true
             }
@@ -339,12 +369,21 @@ impl ClientState {
     /// The flight's last outcome, if it has one. Does NOT consume it: every
     /// waiter must be able to observe the same result.
     pub fn flight_peek(&self, hash: &str) -> Option<Result<Value, Value>> {
-        self.flights.lock().unwrap().get(hash).and_then(|s| s.settled.clone())
+        self.flights
+            .lock()
+            .unwrap()
+            .get(hash)
+            .and_then(|s| s.settled.clone())
     }
 
     /// Whether a flight for `hash` exists and is still open.
     pub fn flight_is_open(&self, hash: &str) -> bool {
-        self.flights.lock().unwrap().get(hash).map(|s| s.open).unwrap_or(false)
+        self.flights
+            .lock()
+            .unwrap()
+            .get(hash)
+            .map(|s| s.open)
+            .unwrap_or(false)
     }
 
     /// Settle an open flight and wake its waiters. Returns false (and does
@@ -388,15 +427,23 @@ impl ClientState {
     /// Directly set a subscription entry (TS `client.subscriptions[h] = x`
     /// written from `handle_message`).
     pub fn set_subscription(&self, subscribe_hash: &str, subscription: Value) {
-        self.subscriptions.lock().unwrap().insert(subscribe_hash.to_string(), subscription);
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .insert(subscribe_hash.to_string(), subscription);
     }
 
     pub fn is_subscribed(&self, subscribe_hash: &str) -> bool {
-        self.subscriptions.lock().unwrap().contains_key(subscribe_hash)
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .contains_key(subscribe_hash)
     }
 
     pub fn send_text(&self, s: String) -> bool {
-        if std::env::var("CCXT_WS_DEBUG").is_ok() { eprintln!("[wssend] {}", s.chars().take(200).collect::<String>()); }
+        if std::env::var("CCXT_WS_DEBUG").is_ok() {
+            eprintln!("[wssend] {}", s.chars().take(200).collect::<String>());
+        }
         // Static-WS-test mock transport: record the frame (JSON-parsed, like the
         // TS `client.connection.send` stub) instead of hitting a socket.
         if *self.mock.lock().unwrap() {
@@ -432,7 +479,9 @@ impl ClientState {
         self.incoming.lock().unwrap().push_back(message);
         self.notify.notify_one();
     }
-    pub fn is_mock(&self) -> bool { *self.mock.lock().unwrap() }
+    pub fn is_mock(&self) -> bool {
+        *self.mock.lock().unwrap()
+    }
     /// The captured outgoing frames as a `Value::List`.
     pub fn mock_sent_value(&self) -> Value {
         Value::Array(self.mock_sent.lock().unwrap().clone())
@@ -444,13 +493,19 @@ impl ClientState {
     pub fn has_queued_messages(&self) -> bool {
         !self.incoming.lock().unwrap().is_empty()
     }
-    pub fn mark_ws_test_completed(&self) { *self.ws_test_completed.lock().unwrap() = true; }
-    pub fn is_ws_test_completed(&self) -> bool { *self.ws_test_completed.lock().unwrap() }
+    pub fn mark_ws_test_completed(&self) {
+        *self.ws_test_completed.lock().unwrap() = true;
+    }
+    pub fn is_ws_test_completed(&self) -> bool {
+        *self.ws_test_completed.lock().unwrap()
+    }
     /// Reject every pending future so a fixture whose frames don't resolve the
     /// watch fails (with a message) rather than hanging the drive loop.
     pub fn reject_pending_futures(&self, err: Value) {
         let hashes: Vec<String> = self.futures.lock().unwrap().iter().cloned().collect();
-        for h in hashes { self.reject(&h, err.clone()); }
+        for h in hashes {
+            self.reject(&h, err.clone());
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -488,8 +543,10 @@ impl ClientState {
             let tagged = match sub {
                 Value::Dict(d) => {
                     let mut inner = (**d).clone();
-                    inner.insert("__ws_sub_ref".to_string(),
-                        Value::Str(format!("{}\u{1}{}", self.url, h)));
+                    inner.insert(
+                        "__ws_sub_ref".to_string(),
+                        Value::Str(format!("{}\u{1}{}", self.url, h)),
+                    );
                     Value::Dict(std::sync::Arc::new(inner))
                 }
                 other => other.clone(),
@@ -504,7 +561,9 @@ impl ClientState {
     pub fn set_subscription_field(&self, hash: &str, key: &str, val: Value) {
         let mut subs = self.subscriptions.lock().unwrap();
         match subs.get_mut(hash) {
-            Some(Value::Dict(d)) => { std::sync::Arc::make_mut(d).insert(key.to_string(), val); }
+            Some(Value::Dict(d)) => {
+                std::sync::Arc::make_mut(d).insert(key.to_string(), val);
+            }
             _ => {
                 let mut inner = indexmap::IndexMap::new();
                 inner.insert(key.to_string(), val);
@@ -545,6 +604,28 @@ pub fn subscribe_raw(url: &str) -> broadcast::Receiver<RawFrame> {
     raw_bus(url).sender.subscribe()
 }
 
+/// Observe every URL from the reader boundary, including not-yet-created slots.
+///
+/// Attach before calling watch when the exchange chooses its own URL internally.
+/// This is a separate 256-frame broadcast queue: a slow observer gets `Lagged`,
+/// never backpressure on the socket or consumption of the parsed drive-loop queue.
+/// Frames from unrelated URLs are included; callers must validate their allowed
+/// endpoint/environment and market before learning a URL from a frame.
+/// Dropping the receiver detaches it; no per-observer registry entry is retained.
+/// This bounds frame count, not payload bytes or the existing parsed queue.
+/// Switching to a per-URL receiver after discovery is not atomic; keep draining
+/// this receiver to avoid a gap between discovery and a second attachment.
+pub fn subscribe_raw_all() -> broadcast::Receiver<RawFrame> {
+    RAW_ALL_BUS.sender.subscribe()
+}
+
+/// Number of all-URL channel capacity overruns, not the sum of receiver losses.
+/// A lagging receiver also gets its own `Lagged(n)` notification. This counter is
+/// process-lifetime and independent of each URL's `raw_overflow_count`.
+pub fn raw_all_overflow_count() -> u64 {
+    RAW_ALL_BUS.overflow.load(Ordering::Relaxed)
+}
+
 /// Frames dropped on `url` because the bounded handoff was full. A lagging receiver
 /// also observes `broadcast::error::RecvError::Lagged`, so a dropped frame is either
 /// counted here or reported to the receiver, never silently lost.
@@ -563,19 +644,25 @@ pub fn client_generation(url: &str) -> Option<u64> {
 /// `client.subscriptions[key] = val` written on a tagged snapshot — persist it
 /// to the live client so subsequent `handle_message` snapshots see it.
 pub fn value_subs_insert(url: &str, key: &str, val: Value) {
-    if let Some(c) = get_client(url) { c.set_subscription(key, val); }
+    if let Some(c) = get_client(url) {
+        c.set_subscription(key, val);
+    }
 }
 
 /// `delete client.subscriptions[key]` on a tagged snapshot.
 pub fn value_subs_remove(url: &str, key: &str) {
-    if let Some(c) = get_client(url) { c.subscriptions.lock().unwrap().remove(key); }
+    if let Some(c) = get_client(url) {
+        c.subscriptions.lock().unwrap().remove(key);
+    }
 }
 
 /// `client.subscriptions[hash][key] = val` written on a tagged subscription
 /// dict (carrying `__ws_sub_ref` = "url\u{1}hash").
 pub fn value_sub_field_write(subref: &str, key: &str, val: Value) {
     if let Some((url, hash)) = subref.split_once('\u{1}') {
-        if let Some(c) = get_client(url) { c.set_subscription_field(hash, key, val); }
+        if let Some(c) = get_client(url) {
+            c.set_subscription_field(hash, key, val);
+        }
     }
 }
 
@@ -587,14 +674,20 @@ pub fn value_sub_field_write(subref: &str, key: &str, val: Value) {
 async fn connect_via_proxy(
     url: &str,
     proxy: &str,
-) -> Result<tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, String> {
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let target = url::Url::parse(url).map_err(|e| format!("[NetworkError] ws url {url}: {e}"))?;
-    let host = target.host_str().ok_or_else(|| format!("[NetworkError] ws url {url} has no host"))?;
+    let host = target
+        .host_str()
+        .ok_or_else(|| format!("[NetworkError] ws url {url} has no host"))?;
     let port = target.port_or_known_default().unwrap_or(443);
     let p = url::Url::parse(proxy).map_err(|e| format!("[NetworkError] ws proxy {proxy}: {e}"))?;
-    let p_host = p.host_str().ok_or_else(|| format!("[NetworkError] ws proxy {proxy} has no host"))?;
+    let p_host = p
+        .host_str()
+        .ok_or_else(|| format!("[NetworkError] ws proxy {proxy} has no host"))?;
     let p_port = p.port_or_known_default().unwrap_or(8080);
     let mut stream = tokio::net::TcpStream::connect((p_host, p_port))
         .await
@@ -614,17 +707,23 @@ async fn connect_via_proxy(
             .await
             .map_err(|e| format!("[NetworkError] ws proxy CONNECT {proxy}: {e}"))?;
         if n == 0 {
-            return Err(format!("[NetworkError] ws proxy {proxy} closed during CONNECT"));
+            return Err(format!(
+                "[NetworkError] ws proxy {proxy} closed during CONNECT"
+            ));
         }
         head.push(byte[0]);
         if head.len() > 8192 {
-            return Err(format!("[NetworkError] ws proxy {proxy} sent an oversized CONNECT reply"));
+            return Err(format!(
+                "[NetworkError] ws proxy {proxy} sent an oversized CONNECT reply"
+            ));
         }
     }
     let status = String::from_utf8_lossy(&head);
     let first = status.lines().next().unwrap_or_default();
     if !first.contains(" 200") {
-        return Err(format!("[NetworkError] ws proxy {proxy} refused CONNECT: {first}"));
+        return Err(format!(
+            "[NetworkError] ws proxy {proxy} refused CONNECT: {first}"
+        ));
     }
     let (ws, _resp) = tokio_tungstenite::client_async_tls(url, stream)
         .await
@@ -654,7 +753,11 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
         }
     };
     let (mut write, mut read) = ws.split();
-    let mut rx = state.pending_rx.lock().unwrap().take()
+    let mut rx = state
+        .pending_rx
+        .lock()
+        .unwrap()
+        .take()
         .ok_or_else(|| format!("[NetworkError] ws {url} slot has no writer channel"))?;
     *state.last_pong_ms.lock().unwrap() = now_ms();
 
@@ -789,22 +892,35 @@ pub fn mock_setup(url: &str) {
     *c.ws_test_completed.lock().unwrap() = false;
 }
 pub fn mock_inject(url: &str, msg: Value) {
-    if let Some(c) = get_client(url) { c.mock_inject(msg); }
+    if let Some(c) = get_client(url) {
+        c.mock_inject(msg);
+    }
 }
 pub fn mock_sent_messages(url: &str) -> Value {
-    match get_client(url) { Some(c) => c.mock_sent_value(), None => Value::Array(vec![]) }
+    match get_client(url) {
+        Some(c) => c.mock_sent_value(),
+        None => Value::Array(vec![]),
+    }
 }
 pub fn mock_has_pending_futures(url: &str) -> bool {
-    get_client(url).map(|c| c.has_pending_futures()).unwrap_or(false)
+    get_client(url)
+        .map(|c| c.has_pending_futures())
+        .unwrap_or(false)
 }
 pub fn mock_has_queued_messages(url: &str) -> bool {
-    get_client(url).map(|c| c.has_queued_messages()).unwrap_or(false)
+    get_client(url)
+        .map(|c| c.has_queued_messages())
+        .unwrap_or(false)
 }
 pub fn mock_mark_completed(url: &str) {
-    if let Some(c) = get_client(url) { c.mark_ws_test_completed(); }
+    if let Some(c) = get_client(url) {
+        c.mark_ws_test_completed();
+    }
 }
 pub fn mock_is_completed(url: &str) -> bool {
-    get_client(url).map(|c| c.is_ws_test_completed()).unwrap_or(true)
+    get_client(url)
+        .map(|c| c.is_ws_test_completed())
+        .unwrap_or(true)
 }
 pub fn mock_reject_futures(url: &str) {
     if let Some(c) = get_client(url) {
@@ -834,7 +950,6 @@ pub fn client_value(url: &str) -> Value {
 pub fn begin_flight(url: &str, hash: &str) -> bool {
     ensure_slot(url).flight_begin(hash)
 }
-
 
 /// The `Value` a `client.future ()` / `client.reusableFuture ()` call hands
 /// back: enough to find the flight again (its client's url + the hash). TS
@@ -961,7 +1076,9 @@ pub fn value_resolve(client: &Value, args: &[Value]) -> Value {
     // hash, so there is no second arg. Resolve that hash.
     if let Some(hash) = future_hash_of(client) {
         if let Some(url) = url_of(client) {
-            if let Some(c) = get_client(&url) { c.resolve(&hash, value.clone()); }
+            if let Some(c) = get_client(&url) {
+                c.resolve(&hash, value.clone());
+            }
         }
         return value;
     }
@@ -987,7 +1104,9 @@ pub fn value_reject(client: &Value, args: &[Value]) -> Value {
     // `client.futures[hash].reject(error)` — future handle carries its own hash.
     if let Some(hash) = future_hash_of(client) {
         if let Some(url) = url_of(client) {
-            if let Some(c) = get_client(&url) { c.reject(&hash, err.clone()); }
+            if let Some(c) = get_client(&url) {
+                c.reject(&hash, err.clone());
+            }
         }
         return err;
     }
@@ -1064,7 +1183,9 @@ mod tests {
                 }
                 // Stream three ticker updates.
                 for px in ["100.5", "101.0", "101.5"] {
-                    let msg = format!("{{\"channel\":\"ticker\",\"symbol\":\"BTC/USDT\",\"last\":\"{px}\"}}");
+                    let msg = format!(
+                        "{{\"channel\":\"ticker\",\"symbol\":\"BTC/USDT\",\"last\":\"{px}\"}}"
+                    );
                     ws.send(WsMessage::Text(msg)).await.unwrap();
                 }
                 // Give the client time to drain before closing.
@@ -1073,6 +1194,57 @@ mod tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn raw_global_observer_attaches_before_url_discovery_and_reports_loss() {
+        // Attach before either URL has a slot: no registry polling or guessed
+        // subscription index is needed to observe their very first frames.
+        let mut all = subscribe_raw_all();
+        let first_url = "raw-global-discovery-first";
+        let second_url = "raw-global-discovery-second";
+        let mut exact = subscribe_raw(first_url);
+        mock_setup(first_url);
+        mock_setup(second_url);
+        let first = get_client(first_url).unwrap();
+        let second = get_client(second_url).unwrap();
+        let payload = b"{\"x\":true,\"q\":\"12.34\"}".to_vec();
+        first.mock_inject_raw(payload.clone(), false);
+        second.mock_inject_raw(payload.clone(), false);
+        let direct = exact.recv().await.unwrap();
+        let mut observed = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while observed.len() < 2 {
+                let frame = all.recv().await.unwrap();
+                if frame.url == first_url || frame.url == second_url {
+                    observed.push(frame);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(observed[0].url, first_url);
+        assert_eq!(observed[1].url, second_url);
+        assert_eq!(observed[0].payload, payload);
+        assert_eq!(observed[0].ingress_at, direct.ingress_at);
+        assert_eq!(observed[0].ingress_unix_ms, direct.ingress_unix_ms);
+        assert_eq!(observed[0].generation, direct.generation);
+        assert!(
+            first.has_queued_messages(),
+            "raw observation must not consume parsed input"
+        );
+        let before = raw_all_overflow_count();
+        for _ in 0..RAW_BUS_CAPACITY + 3 {
+            first.mock_inject_raw(payload.clone(), false);
+        }
+        assert!(raw_all_overflow_count() >= before + 3);
+        assert!(matches!(all.try_recv(), Err(broadcast::error::TryRecvError::Lagged(n)) if n >= 3));
+        // One URL's direct observer is independent of the all-URL receiver.
+        assert!(
+            matches!(exact.try_recv(), Err(broadcast::error::TryRecvError::Lagged(n)) if n >= 3)
+        );
+        drop_client(first_url);
+        drop_client(second_url);
     }
 
     #[tokio::test]
@@ -1189,7 +1361,10 @@ mod tests {
         let url = "flight-test-election";
         let c = ensure_slot(url);
         assert!(c.flight_begin("authenticate:future"), "first caller leads");
-        assert!(!c.flight_begin("authenticate:future"), "second caller follows");
+        assert!(
+            !c.flight_begin("authenticate:future"),
+            "second caller follows"
+        );
         // The follower's `messageHash in client.futures` test must see it.
         assert!(in_op_futures(&c, "authenticate:future"));
         drop_client(url);
@@ -1232,7 +1407,10 @@ mod tests {
         let started = std::time::Instant::now();
         let got = ws_await_flight(&flight_handle(url, "auth", false)).await;
         assert_eq!(got, Value::Str("late".to_string()));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(50), "waited for the leader");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "waited for the leader"
+        );
         settler.await.unwrap();
         drop_client(url);
     }
@@ -1251,7 +1429,10 @@ mod tests {
             ws_await_flight(&flight_handle(url, "authenticated", led)).await,
             Value::Null
         );
-        assert!(started.elapsed() < std::time::Duration::from_millis(200), "returned at once");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "returned at once"
+        );
         // Having led once and settled, the value is still there for a re-await.
         c.resolve("authenticated", Value::Bool(true));
         let led2 = c.flight_begin("authenticated");
@@ -1269,7 +1450,10 @@ mod tests {
         // wanted is already in the venue's own cache.
         let url = "flight-test-missing";
         ensure_slot(url);
-        assert_eq!(ws_await_flight(&flight_handle(url, "nope", false)).await, Value::Null);
+        assert_eq!(
+            ws_await_flight(&flight_handle(url, "nope", false)).await,
+            Value::Null
+        );
         drop_client(url);
     }
 
