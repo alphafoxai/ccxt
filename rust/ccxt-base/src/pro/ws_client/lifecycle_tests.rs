@@ -324,3 +324,95 @@ async fn spare_payload_capacity_cannot_bypass_retained_byte_limits() {
     assert_eq!(frame.payload, b"pong");
     assert!(!scope.close_and_join(BOUND).await.all_joined());
 }
+
+#[tokio::test]
+async fn stale_value_handles_and_subscription_references_cannot_mutate_replacement() {
+    let scope = ClientScope::new();
+    scope
+        .run(async {
+            let url = "fixture-stale-value-handle";
+            let old = ensure_slot(url);
+            old.set_subscription("channel", Value::Map(indexmap::IndexMap::new()));
+            let handle = client_value(url);
+            let old_subscriptions = old.subscriptions_value();
+            let reference = old.reference();
+            let field_reference = serde_json::to_string(&(old.reference(), "channel")).unwrap();
+            let future = value_open_flight(&handle, Value::Str("flight".into()));
+            assert!(old.close_and_join(BOUND).await.all_joined());
+            let new = ensure_slot(url);
+            new.set_subscription("keep", Value::Bool(true));
+            new.flight_begin("flight");
+            for stale in [&handle, &future] {
+                value_resolve(stale, &[Value::Int(1), Value::Str("flight".into())]);
+                value_reject(
+                    stale,
+                    &[Value::Str("bad".into()), Value::Str("flight".into())],
+                );
+                value_send(stale, &[Value::Str("unexpected".into())]);
+                value_reset(stale);
+                value_open_flight(stale, Value::Str("unwanted".into()));
+            }
+            value_subs_insert(&reference, "new", Value::Bool(true));
+            value_subs_remove(&reference, "keep");
+            value_sub_field_write(&field_reference, "changed", Value::Bool(true));
+            assert!(new.take_settled(&["flight".into()]).is_none());
+            assert!(new.flight_peek("flight").is_none());
+            assert!(new.is_subscribed("keep"));
+            assert!(!new.is_subscribed("new") && !new.is_subscribed("channel"));
+            assert!(!new.flight_is_open("unwanted"));
+            assert_eq!(new.outgoing_budget.available_permits(), OUTGOING_BYTES);
+            assert_eq!(ws_await_flight(&future).await, Value::Null);
+            assert_eq!(
+                crate::get_value(&handle, &Value::Str("subscriptions".into())),
+                Value::Map(indexmap::IndexMap::new())
+            );
+            assert_ne!(old_subscriptions, new.subscriptions_value());
+            // Positive control: current-generation bridge still resolves correctly.
+            let fresh = client_value(url);
+            value_resolve(&fresh, &[Value::Int(2), Value::Str("flight".into())]);
+            assert_eq!(
+                new.take_settled(&["flight".into()]),
+                Some(Ok(Value::Int(2)))
+            );
+        })
+        .await;
+    assert!(scope.close_and_join(BOUND).await.all_joined());
+}
+
+#[tokio::test]
+async fn value_handle_from_foreign_live_scope_is_not_routable() {
+    let owner = ClientScope::new();
+    let url = "fixture-live-foreign-handle";
+    let handle = owner.run(async { client_value(url) }).await;
+    let foreign = ClientScope::new();
+    foreign
+        .run(async {
+            value_send(&handle, &[Value::Str("not-owned".into())]);
+            value_resolve(&handle, &[Value::Int(1), Value::Str("hash".into())]);
+        })
+        .await;
+    let client = get_client(url).unwrap();
+    assert_eq!(client.outgoing_budget.available_permits(), OUTGOING_BYTES);
+    assert!(client.take_settled(&["hash".into()]).is_none());
+    assert!(owner.close_and_join(BOUND).await.all_joined());
+}
+
+#[tokio::test]
+async fn mock_capture_has_an_aggregate_byte_budget() {
+    let scope = ClientScope::new();
+    let client = scope
+        .run(async { ensure_slot("fixture-mock-byte-bound") })
+        .await;
+    client.mock_enable();
+    for _ in 0..5 {
+        if !client.send_text("x".repeat(MAX_PAYLOAD_BYTES)) {
+            break;
+        }
+    }
+    assert!(client
+        .terminal_error()
+        .unwrap()
+        .contains("mock capture byte budget"));
+    assert!(client.mock_sent.lock().unwrap().len() < OUTGOING_CAPACITY);
+    assert!(!scope.close_and_join(BOUND).await.all_joined());
+}

@@ -92,7 +92,7 @@ impl ParsedQueue {
 /// shared `Arc` storage may therefore be counted more than once; that is
 /// intentional because this is a conservative accounting bound, not an
 /// allocator or process-RSS measurement.
-fn estimate_value_bytes(value: &Value) -> usize {
+pub(super) fn estimate_value_bytes(value: &Value) -> usize {
     let mut total = size_of::<Value>();
     match value {
         Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) => {}

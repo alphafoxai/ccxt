@@ -10,7 +10,10 @@ Use one `ClientScope` per caller-owned collector. Drive each complete watch futu
 with `scope.run(future)`; task locals are not inherited by `tokio::spawn`.
 Generated watch signatures do not change. Each scope tracks exact client generations,
 including slots acquired before connecting or before the first inbound frame. A URL
-owned by another scope/unscoped caller is rejected, not silently shared.
+owned by another scope/unscoped caller is rejected, not silently shared. Value client,
+future and subscription references also carry scope/generation identity. Bridge operations
+retain the validated Arc rather than re-looking up the URL; a stale handle cannot send,
+resolve, reset, open a flight or mutate subscriptions on a replacement generation.
 
 Stop and join caller-owned watch/driver tasks, then await
 `scope.close_and_join(Duration)`. `ScopeJoinReport` reports client and awaited-task
@@ -85,7 +88,7 @@ cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --all-
 cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --features transpiled-base --all-targets -- -D warnings
 ```
 
-Actual results: **72 default tests**, **77 transpiled-base tests** passed (34 are
+Actual results: **75 default tests**, **80 transpiled-base tests** passed (37 are
 transport tests); three pre-existing doctests remain ignored in each mode. Both
 Clippy modes and the targeted rustfmt check passed. Tests prove peer EOF after scoped
 join, zero-started-task pending-handshake cancellation, join cancellation/retry,
@@ -94,4 +97,10 @@ old-generation removal fencing, raw key churn and observer continuity, separate
 queue byte/count limits, compressed expansion boundaries and fragmented aggregate
 wire rejection. A spare-capacity regression proves a short payload cannot hide an
 oversized allocation behind its length. These tests do not prove every venue's
-real-world payload fits these defaults.
+real-world payload fits these defaults. Review regressions also cover stale/foreign
+Value-handle mutation fencing and the mock capture's aggregate byte budget.
+
+The pre-existing single-flight API deliberately retains the prior settlement on reopen
+(see the existing leader/no-op regression). A separate flight-cycle token redesign is
+not included here. Scope/socket generation fencing is not a claim that all concurrent
+authentication-flight semantics or venue retained-state budgets have been corrected.

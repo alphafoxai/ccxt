@@ -592,7 +592,18 @@ impl ClientState {
                 self.fail("[NetworkError] mock capture full".into());
                 return false;
             }
-            sent.push(parse_text(&s));
+            let value = parse_text(&s);
+            let bytes = sent
+                .iter()
+                .fold(bounds::estimate_value_bytes(&value), |sum, item| {
+                    sum.saturating_add(bounds::estimate_value_bytes(item))
+                });
+            if bytes > OUTGOING_BYTES {
+                drop(sent);
+                self.fail("[NetworkError] mock capture byte budget exceeded".into());
+                return false;
+            }
+            sent.push(value);
             return true;
         }
         self.send_message(Message::Text(s))
@@ -670,7 +681,7 @@ impl ClientState {
     pub fn subscriptions_value(&self) -> Value {
         let subs = self.subscriptions.lock().unwrap();
         let mut m = indexmap::IndexMap::new();
-        m.insert("__ws_subs_url".to_string(), Value::Str(self.url.clone()));
+        m.insert("__ws_subs_url".to_string(), Value::Str(self.reference()));
         for (h, sub) in subs.iter() {
             // Tag each subscription DICT with a back-reference so a field write
             // on it (`subscription['receivedSnapshot'] = true`) persists to this
@@ -681,7 +692,7 @@ impl ClientState {
                     let mut inner = (**d).clone();
                     inner.insert(
                         "__ws_sub_ref".to_string(),
-                        Value::Str(format!("{}\u{1}{}", self.url, h)),
+                        Value::Str(serde_json::to_string(&(self.reference(), h)).unwrap()),
                     );
                     Value::Dict(std::sync::Arc::new(inner))
                 }
@@ -718,6 +729,7 @@ impl ClientState {
             // routes back to this ClientState — see value_resolve/value_reject.
             let mut fh = indexmap::IndexMap::new();
             fh.insert("url".to_string(), Value::Str(self.url.clone()));
+            fh.insert("__ws_reference".to_string(), Value::Str(self.reference()));
             fh.insert("__ws_future_hash".to_string(), Value::Str(h.clone()));
             m.insert(h.clone(), Value::Map(fh));
         }
@@ -728,7 +740,10 @@ impl ClientState {
 /// Get the existing client for `url`, or `None` if not yet connected.
 pub fn get_client(url: &str) -> Option<Arc<ClientState>> {
     let reg = REGISTRY.lock().unwrap();
-    reg.get(url).filter(|c| !c.is_closed()).cloned()
+    let caller = lifecycle::scope_id();
+    reg.get(url)
+        .filter(|c| !c.is_closed() && (caller == 0 || caller == c.scope_id))
+        .cloned()
 }
 
 /// Attach a raw observer to `url`.
@@ -786,24 +801,24 @@ pub fn client_generation(url: &str) -> Option<u64> {
 /// `client.subscriptions[key] = val` written on a tagged snapshot — persist it
 /// to the live client so subsequent `handle_message` snapshots see it.
 pub fn value_subs_insert(url: &str, key: &str, val: Value) {
-    if let Some(c) = get_client(url) {
+    if let Some(c) = client_from_reference(url) {
         c.set_subscription(key, val);
     }
 }
 
 /// `delete client.subscriptions[key]` on a tagged snapshot.
 pub fn value_subs_remove(url: &str, key: &str) {
-    if let Some(c) = get_client(url) {
+    if let Some(c) = client_from_reference(url) {
         c.subscriptions.lock().unwrap().remove(key);
     }
 }
 
 /// `client.subscriptions[hash][key] = val` written on a tagged subscription
-/// dict (carrying `__ws_sub_ref` = "url\u{1}hash").
+/// dict (carrying a JSON-encoded generation reference and subscription hash).
 pub fn value_sub_field_write(subref: &str, key: &str, val: Value) {
-    if let Some((url, hash)) = subref.split_once('\u{1}') {
-        if let Some(c) = get_client(url) {
-            c.set_subscription_field(hash, key, val);
+    if let Ok((reference, hash)) = serde_json::from_str::<(String, String)>(subref) {
+        if let Some(c) = client_from_reference(&reference) {
+            c.set_subscription_field(&hash, key, val);
         }
     }
 }
@@ -985,8 +1000,8 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
 /// Live read of a client handle's `subscriptions` / `futures` field, straight
 /// from the registry so a read after a write (upbit builds its subscribe frame
 /// from subscriptions it just set) is coherent, not a stale embedded snapshot.
-pub fn client_field_live(url: &str, field: &str) -> Value {
-    match get_client(url) {
+pub fn client_field_live(reference: &str, field: &str) -> Value {
+    match client_from_reference(reference) {
         Some(c) if field == "futures" => c.futures_value(),
         Some(c) => c.subscriptions_value(),
         None => Value::Map(indexmap::IndexMap::new()),
@@ -1118,6 +1133,7 @@ pub fn client_value(url: &str) -> Value {
     let c = ensure_slot(url);
     let mut m = indexmap::IndexMap::new();
     m.insert("url".to_string(), Value::Str(url.to_string()));
+    m.insert("__ws_reference".to_string(), Value::Str(c.reference()));
     m.insert("subscriptions".to_string(), c.subscriptions_value());
     m.insert("futures".to_string(), c.futures_value());
     Value::Map(m)
@@ -1136,8 +1152,16 @@ pub fn begin_flight(url: &str, hash: &str) -> bool {
 /// returns a real Future object; a `Value` can't hold one, so the port returns
 /// a handle and `ws_await_flight` does the awaiting.
 pub fn flight_handle(url: &str, hash: &str, led: bool) -> Value {
+    let Some(client) = get_client(url) else {
+        return Value::Null;
+    };
+    flight_handle_for(&client, hash, led)
+}
+
+fn flight_handle_for(client: &ClientState, hash: &str, led: bool) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("url".to_string(), Value::Str(url.to_string()));
+    m.insert("url".to_string(), Value::Str(client.url.clone()));
+    m.insert("__ws_reference".to_string(), Value::Str(client.reference()));
     m.insert("__ws_flight_hash".to_string(), Value::Str(hash.to_string()));
     // Whether the call that produced this handle opened the flight. A leader
     // settles its own flight (and TS's `await future` resolves the instant it
@@ -1170,7 +1194,7 @@ pub async fn ws_await_flight(handle: &Value) -> Value {
         (Some(u), Some(h)) => (u, h),
         _ => return Value::Null,
     };
-    let client = match get_client(&url) {
+    let client = match client_from_handle(handle) {
         Some(c) => c,
         None => return Value::Null,
     };
@@ -1249,23 +1273,54 @@ fn hash_str(v: &Value) -> Option<String> {
     }
 }
 
-/// `client.resolve(value, messageHash)` routed by URL. Returns `value`.
+impl ClientState {
+    fn reference(&self) -> String {
+        serde_json::to_string(&(self.scope_id, self.generation, &self.url)).unwrap()
+    }
+}
+
+fn client_from_reference(reference: &str) -> Option<Arc<ClientState>> {
+    let (scope, generation, url): (u64, u64, String) = serde_json::from_str(reference).ok()?;
+    if scope != lifecycle::scope_id() {
+        return None;
+    }
+    // Return the matched Arc, not a URL to look up again after the check.
+    let registry = REGISTRY.lock().unwrap();
+    registry
+        .get(&url)
+        .filter(|client| {
+            client.scope_id == scope && client.generation == generation && !client.is_closed()
+        })
+        .cloned()
+}
+
+fn client_from_handle(handle: &Value) -> Option<Arc<ClientState>> {
+    match crate::get_value(handle, &Value::Str("__ws_reference".to_owned())) {
+        Value::Str(reference) => client_from_reference(&reference),
+        _ => None,
+    }
+}
+
+/// Open a flight only on the exact client generation named by a Value handle.
+pub fn value_open_flight(handle: &Value, hash: Value) -> Value {
+    let Value::Str(ref name) = hash else {
+        return hash;
+    };
+    let Some(client) = client_from_handle(handle) else {
+        return hash;
+    };
+    let leader = client.flight_begin(name);
+    flight_handle_for(&client, name, leader)
+}
+
+/// `client.resolve(value, messageHash)` routed to an exact generation.
 pub fn value_resolve(client: &Value, args: &[Value]) -> Value {
     let value = args.get(0).cloned().unwrap_or(Value::Null);
-    // `client.futures[hash].resolve(value)` — the future handle carries its own
-    // hash, so there is no second arg. Resolve that hash.
-    if let Some(hash) = future_hash_of(client) {
-        if let Some(url) = url_of(client) {
-            if let Some(c) = get_client(&url) {
-                c.resolve(&hash, value.clone());
-            }
-        }
-        return value;
-    }
-    if let (Some(url), Some(hash)) = (url_of(client), args.get(1).and_then(hash_str)) {
-        if let Some(c) = get_client(&url) {
-            c.resolve(&hash, value.clone());
-        }
+    if let (Some(owner), Some(hash)) = (
+        client_from_handle(client),
+        future_hash_of(client).or_else(|| args.get(1).and_then(hash_str)),
+    ) {
+        owner.resolve(&hash, value.clone());
     }
     value
 }
@@ -1278,66 +1333,43 @@ fn future_hash_of(client: &Value) -> Option<String> {
     }
 }
 
-/// `client.reject(error, messageHash)` routed by URL.
+/// `client.reject(error, messageHash)` routed to an exact generation.
 pub fn value_reject(client: &Value, args: &[Value]) -> Value {
-    let err = args.get(0).cloned().unwrap_or(Value::Null);
-    // `client.futures[hash].reject(error)` — future handle carries its own hash.
-    if let Some(hash) = future_hash_of(client) {
-        if let Some(url) = url_of(client) {
-            if let Some(c) = get_client(&url) {
-                c.reject(&hash, err.clone());
-            }
-        }
-        return err;
-    }
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            match args.get(1).and_then(hash_str) {
-                Some(hash) => c.reject(&hash, err.clone()),
-                // reject with no hash → reject every pending future.
-                None => {
-                    let hashes: Vec<String> = c.futures.lock().unwrap().iter().cloned().collect();
-                    for h in hashes {
-                        c.reject(&h, err.clone());
-                    }
-                }
-            }
+    let error = args.get(0).cloned().unwrap_or(Value::Null);
+    if let Some(owner) = client_from_handle(client) {
+        match future_hash_of(client).or_else(|| args.get(1).and_then(hash_str)) {
+            Some(hash) => owner.reject(&hash, error.clone()),
+            None => owner.reject_pending_futures(error.clone()),
         }
     }
-    err
+    error
 }
 
-/// `client.send(message)` routed by URL. Serialises non-string payloads to JSON.
+/// `client.send(message)` routed to an exact generation.
 pub fn value_send(client: &Value, args: &[Value]) -> Value {
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            let payload = match args.get(0) {
-                Some(Value::Str(s)) => s.clone(),
-                Some(v) => v.to_json().to_string(),
-                None => String::new(),
-            };
-            c.send_text(payload);
-        }
+    if let Some(owner) = client_from_handle(client) {
+        let payload = match args.get(0) {
+            Some(Value::Str(value)) => value.clone(),
+            Some(value) => value.to_json().to_string(),
+            None => String::new(),
+        };
+        owner.send_text(payload);
     }
     Value::Null
 }
 
-/// `client.reset(...)` routed by URL.
+/// `client.reset(...)` routed to an exact generation.
 pub fn value_reset(client: &Value) -> Value {
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            c.reset();
-        }
+    if let Some(owner) = client_from_handle(client) {
+        owner.reset();
     }
     Value::Null
 }
 
-/// `client.on_pong(...)` routed by URL.
+/// `client.on_pong(...)` routed to an exact generation.
 pub fn value_on_pong(client: &Value) -> Value {
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            c.on_pong();
-        }
+    if let Some(owner) = client_from_handle(client) {
+        owner.on_pong();
     }
     Value::Null
 }
