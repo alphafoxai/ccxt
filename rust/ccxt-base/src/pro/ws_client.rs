@@ -321,6 +321,9 @@ impl ClientState {
         let ingress_unix_ms = now_ms();
         match bounds::decode(&payload, is_binary) {
             Ok(value) => {
+                // Do not retain spare caller/decoder Vec capacity behind a tiny
+                // payload length. Box conversion gives the bus an exact-size Vec.
+                let payload = payload.into_boxed_slice().into_vec();
                 self.observe_raw(payload, is_binary, ingress_at, ingress_unix_ms);
                 self.push_incoming(value);
             }
@@ -332,9 +335,21 @@ impl ClientState {
         if self.is_closed() {
             return false;
         }
-        let bytes = message.len();
-        if bytes > MAX_PAYLOAD_BYTES {
+        if message.len() > MAX_PAYLOAD_BYTES {
             self.fail("[NetworkError] outgoing payload exceeds limit".into());
+            return false;
+        }
+        // Charge retained allocation capacity, not just logical payload length:
+        // a caller can pass a short String with a very large reservation.
+        let bytes = match &message {
+            Message::Text(value) => value.capacity(),
+            Message::Binary(value) | Message::Ping(value) | Message::Pong(value) => {
+                value.capacity()
+            }
+            _ => message.len(),
+        };
+        if bytes > OUTGOING_BYTES {
+            self.fail("[NetworkError] outgoing byte budget exceeded".into());
             return false;
         }
         let permit = match self

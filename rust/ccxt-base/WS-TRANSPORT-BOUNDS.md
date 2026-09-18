@@ -36,7 +36,7 @@ tasks, **not** caller-owned connect/watch futures: join those outer futures firs
 | Individual wire frame | 256 KiB |
 | Expanded gzip/raw-deflate payload | 1 MiB |
 | Parsed inbound queue | 256 entries and 4 MiB accounting budget |
-| Outgoing queue | 64 entries and 1 MiB payload permits, including the in-flight write |
+| Outgoing queue | 64 entries and 1 MiB retained payload-capacity permits, including the in-flight write |
 | Tungstenite write buffer | 1 MiB |
 | Raw URL bus | 64 entries × 256 KiB = 16 MiB retained payload |
 | Global raw bus | 256 entries × 256 KiB = 64 MiB retained payload |
@@ -47,7 +47,9 @@ tasks, **not** caller-owned connect/watch futures: join those outer futures firs
 
 The parsed accounting includes a conservative structural estimate, not serialized
 JSON bytes alone. It is not an allocator/RSS measurement. Raw bounds are payload
-bounds: URL/record metadata and consumer-owned clones are additional. Queue limits
+bounds: URL/record metadata and consumer-owned clones are additional. Raw payload
+vectors shed spare capacity before retention; outgoing permits charge retained
+String/Vec capacity, not just length. Queue limits
 do not bound venue caches, resolved/subscription/flight maps, or the entire process.
 A reconnecting long-lived caller must finish its scope and create another before the
 generation ceiling; exceeding a limit is an explicit failure, not implicit recovery.
@@ -83,11 +85,13 @@ cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --all-
 cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --features transpiled-base --all-targets -- -D warnings
 ```
 
-Actual results: **71 default tests**, **76 transpiled-base tests** passed (33 are
+Actual results: **72 default tests**, **77 transpiled-base tests** passed (34 are
 transport tests); three pre-existing doctests remain ignored in each mode. Both
 Clippy modes and the targeted rustfmt check passed. Tests prove peer EOF after scoped
 join, zero-started-task pending-handshake cancellation, join cancellation/retry,
 concurrent joins, explicit timeout and panic outcomes, owner conflict isolation,
 old-generation removal fencing, raw key churn and observer continuity, separate
 queue byte/count limits, compressed expansion boundaries and fragmented aggregate
-wire rejection. They do not prove every venue's real-world payload fits these defaults.
+wire rejection. A spare-capacity regression proves a short payload cannot hide an
+oversized allocation behind its length. These tests do not prove every venue's
+real-world payload fits these defaults.

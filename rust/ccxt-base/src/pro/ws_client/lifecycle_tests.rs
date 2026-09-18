@@ -302,3 +302,25 @@ async fn internal_panic_is_joined_but_not_reported_as_success() {
     assert!(!report.all_joined() && !report.timed_out);
     assert!(report.failures[0].contains("panic"));
 }
+
+#[tokio::test]
+async fn spare_payload_capacity_cannot_bypass_retained_byte_limits() {
+    let scope = ClientScope::new();
+    let outgoing = scope
+        .run(async { ensure_slot("fixture-spare-outgoing") })
+        .await;
+    let mut text = String::with_capacity(OUTGOING_BYTES + 1);
+    text.push('x');
+    assert!(!outgoing.send_text(text));
+    assert!(outgoing.terminal_error().unwrap().contains("byte budget"));
+
+    let incoming = scope.run(async { ensure_slot("fixture-spare-raw") }).await;
+    let mut raw = subscribe_raw(&incoming.url);
+    let mut bytes = Vec::with_capacity(OUTGOING_BYTES + 1);
+    bytes.extend_from_slice(b"pong");
+    incoming.mock_inject_raw(bytes, false);
+    let frame = raw.recv().await.unwrap();
+    assert_eq!(frame.payload.capacity(), frame.payload.len());
+    assert_eq!(frame.payload, b"pong");
+    assert!(!scope.close_and_join(BOUND).await.all_joined());
+}
