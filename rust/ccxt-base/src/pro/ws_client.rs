@@ -18,7 +18,14 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+mod bounds;
+mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
+use bounds::{ParsedQueue, MAX_PAYLOAD_BYTES, OUTGOING_BYTES, OUTGOING_CAPACITY};
+pub use lifecycle::{ClientScope, ScopeFailure, ScopeFailureSource, ScopeJoinReport};
+
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -37,17 +44,23 @@ use crate::Value;
 pub struct ClientState {
     pub url: String,
     /// Frames queued for the writer task → socket.
-    outgoing: mpsc::UnboundedSender<Message>,
+    outgoing: mpsc::Sender<Outgoing>,
+    outgoing_budget: Arc<tokio::sync::Semaphore>,
+    scope_id: u64,
+    tasks: Mutex<lifecycle::Tasks>,
+    join_gate: tokio::sync::Mutex<()>,
+    close_notify: Notify,
+    error: Mutex<Option<ScopeFailure>>,
     /// Receiver half held until the socket connects (a slot is pre-registered
     /// before connecting so `client.subscriptions` writes persist — upbit builds
     /// its subscribe frame from subscriptions set before the socket is up). The
     /// writer task takes this on connect.
-    pending_rx: Mutex<Option<mpsc::UnboundedReceiver<Message>>>,
+    pending_rx: Mutex<Option<mpsc::Receiver<Outgoing>>>,
     /// Serializes the (async) connect so concurrent `ensure_client`s for a
     /// pre-registered slot don't open two sockets.
     connect_gate: tokio::sync::Mutex<()>,
     /// Parsed inbound messages awaiting dispatch to `handle_message`.
-    incoming: Mutex<VecDeque<Value>>,
+    incoming: Mutex<ParsedQueue>,
     /// Taken from `NEXT_GENERATION` at construction.
     generation: u64,
     /// Woken on: new inbound message, a resolve/reject, or close.
@@ -93,7 +106,34 @@ struct FlightSlot {
 }
 
 /// Capacity of the bounded reader-boundary raw handoff, per URL.
-const RAW_BUS_CAPACITY: usize = 256;
+/// With MAX_PAYLOAD_BYTES this bounds retained raw payload to 16 MiB per URL.
+const RAW_BUS_CAPACITY: usize = 64;
+const MAX_RAW_URLS: usize = 256;
+
+struct Outgoing {
+    message: Message,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn socket_failure_source(error: &tokio_tungstenite::tungstenite::Error) -> ScopeFailureSource {
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
+    match error {
+        Error::Io(_)
+        | Error::ConnectionClosed
+        | Error::AlreadyClosed
+        | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            ScopeFailureSource::TransportTerminal
+        }
+        _ => ScopeFailureSource::Internal,
+    }
+}
+
+struct TaskExit(Arc<ClientState>);
+impl Drop for TaskExit {
+    fn drop(&mut self) {
+        self.0.request_close();
+    }
+}
 
 /// Monotonic generation counter. Each `ClientState` takes one, so a reconnect that
 /// replaces a URL socket also replaces its generation, which lets an observer tell
@@ -139,7 +179,8 @@ static RAW_BUS: Lazy<Mutex<HashMap<String, Arc<RawBus>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Capacity of the bounded global raw handoff. See `subscribe_raw_all`.
-const RAW_ALL_CAPACITY: usize = 4096;
+/// At most 64 MiB of retained raw payload (not whole-process RSS).
+const RAW_ALL_CAPACITY: usize = 256;
 
 /// The global handoff is created on first use, so a process that never asks for it
 /// pays one relaxed atomic load per frame and nothing else.
@@ -173,8 +214,26 @@ fn raw_all_bus_if_open() -> Option<Arc<RawAllBus>> {
     RAW_ALL_BUS.lock().unwrap().clone()
 }
 
-fn raw_bus(url: &str) -> Arc<RawBus> {
+/// Reclaim unsubscribed URL keys. Active observers survive socket replacement.
+/// Called on subscribe/publish/close; no background registry sweeper is spawned.
+pub fn reclaim_raw_buses() {
+    RAW_BUS
+        .lock()
+        .unwrap()
+        .retain(|_, bus| bus.sender.receiver_count() != 0);
+}
+
+fn raw_bus(url: &str) -> broadcast::Receiver<RawFrame> {
+    assert!(
+        url.len() <= 4096,
+        "[NetworkError] raw observer URL exceeds limit"
+    );
     let mut bus = RAW_BUS.lock().unwrap();
+    bus.retain(|_, bus| bus.sender.receiver_count() != 0);
+    if !bus.contains_key(url) && bus.len() >= MAX_RAW_URLS {
+        drop(bus);
+        panic!("[NetworkError] raw observer URL registry is full");
+    }
     bus.entry(url.to_string())
         .or_insert_with(|| {
             Arc::new(RawBus {
@@ -182,7 +241,8 @@ fn raw_bus(url: &str) -> Arc<RawBus> {
                 overflow: AtomicU64::new(0),
             })
         })
-        .clone()
+        .sender
+        .subscribe()
 }
 
 /// Monotonic-ish wall clock in ms. `SystemTime` is fine here (keep-alive only).
@@ -204,32 +264,9 @@ fn parse_text(t: &str) -> Value {
 
 /// Decode a binary frame: try raw-inflate then gzip (the two schemes venues
 /// use), fall back to the bytes as UTF-8. Then parse as text.
+#[cfg(test)]
 fn parse_binary(b: &[u8]) -> Value {
-    use std::io::Read;
-    // gzip
-    {
-        let mut d = flate2::read::GzDecoder::new(b);
-        let mut s = String::new();
-        if d.read_to_string(&mut s).is_ok() && !s.is_empty() {
-            return parse_text(&s);
-        }
-    }
-    // raw deflate (no zlib header)
-    {
-        let mut d = flate2::read::DeflateDecoder::new(b);
-        let mut s = String::new();
-        if d.read_to_string(&mut s).is_ok() && !s.is_empty() {
-            return parse_text(&s);
-        }
-    }
-    // Uncompressed and valid UTF-8 → parse as text/JSON (covers venues that
-    // send plain-JSON frames over the binary opcode).
-    if let Ok(s) = std::str::from_utf8(b) {
-        return parse_text(s);
-    }
-    // Genuine binary payload (e.g. mexc protobuf): carry the raw bytes through
-    // as the port's byte-array form so `isBinaryMessage`/`decodeProtoMsg` see them.
-    crate::exchange_stubs::bytes_to_value(b)
+    bounds::decode(b, true).expect("valid binary fixture")
 }
 
 impl ClientState {
@@ -243,10 +280,9 @@ impl ClientState {
         ingress_at: Instant,
         ingress_unix_ms: i64,
     ) {
-        let bus = raw_bus(&self.url);
-        if bus.sender.len() >= RAW_BUS_CAPACITY {
-            bus.overflow.fetch_add(1, Ordering::Relaxed);
-        }
+        // Never create URL keys merely because a socket receives traffic.
+        let mut buses = RAW_BUS.lock().unwrap();
+        buses.retain(|_, bus| bus.sender.receiver_count() != 0);
         let frame = RawFrame {
             url: self.url.clone(),
             generation: self.generation,
@@ -255,7 +291,14 @@ impl ClientState {
             is_binary,
             payload,
         };
-        let _ = bus.sender.send(frame.clone());
+        if let Some(bus) = buses.get(&self.url) {
+            if bus.sender.len() >= RAW_BUS_CAPACITY {
+                bus.overflow.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = bus.sender.send(frame.clone());
+        }
+        // Serialize publishers through the same lock so overflow accounting has
+        // no concurrent-publisher undercount. Lagged remains receiver-authoritative.
         // The global handoff is a second, deliberately broader tap: a caller that does
         // not know which URL the venue will derive for a subscription can still
         // observe the socket. It is bounded and counted the same way.
@@ -272,9 +315,79 @@ impl ClientState {
         self.generation
     }
 
-    fn push_incoming(&self, v: Value) {
-        self.incoming.lock().unwrap().push_back(v);
+    fn push_incoming(&self, value: Value) {
+        if self.is_closed() {
+            return;
+        }
+        let result = self.incoming.lock().unwrap().push(value);
+        if let Err(error) = result {
+            self.fail(error);
+        }
         self.notify.notify_waiters();
+    }
+
+    fn receive_payload(&self, payload: Vec<u8>, is_binary: bool) {
+        if self.is_closed() {
+            return;
+        }
+        let ingress_at = Instant::now();
+        let ingress_unix_ms = now_ms();
+        match bounds::decode(&payload, is_binary) {
+            Ok(value) => {
+                // Do not retain spare caller/decoder Vec capacity behind a tiny
+                // payload length. Box conversion gives the bus an exact-size Vec.
+                let payload = payload.into_boxed_slice().into_vec();
+                self.observe_raw(payload, is_binary, ingress_at, ingress_unix_ms);
+                self.push_incoming(value);
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn send_message(&self, message: Message) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        if message.len() > MAX_PAYLOAD_BYTES {
+            self.fail("[NetworkError] outgoing payload exceeds limit".into());
+            return false;
+        }
+        // Charge retained allocation capacity, not just logical payload length:
+        // a caller can pass a short String with a very large reservation.
+        let bytes = match &message {
+            Message::Text(value) => value.capacity(),
+            Message::Binary(value) | Message::Ping(value) | Message::Pong(value) => {
+                value.capacity()
+            }
+            _ => message.len(),
+        };
+        if bytes > OUTGOING_BYTES {
+            self.fail("[NetworkError] outgoing byte budget exceeded".into());
+            return false;
+        }
+        let permit = match self
+            .outgoing_budget
+            .clone()
+            .try_acquire_many_owned(bytes.max(1) as u32)
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.fail("[NetworkError] outgoing byte budget exceeded".into());
+                return false;
+            }
+        };
+        if self
+            .outgoing
+            .try_send(Outgoing {
+                message,
+                _permit: permit,
+            })
+            .is_err()
+        {
+            self.fail("[NetworkError] outgoing queue full or closed".into());
+            return false;
+        }
+        true
     }
 
     /// Await the next inbound message. `None` once the socket is closed and
@@ -284,7 +397,10 @@ impl ClientState {
         let mock = *self.mock.lock().unwrap();
         loop {
             let notified = self.notify.notified();
-            if let Some(v) = self.incoming.lock().unwrap().pop_front() {
+            if let Some(error) = self.terminal_error() {
+                panic!("{error}");
+            }
+            if let Some(v) = self.incoming.lock().unwrap().pop() {
                 return Some(v);
             }
             if *self.closed.lock().unwrap() {
@@ -295,7 +411,10 @@ impl ClientState {
                 // If nothing arrives within a short window the fixture is
                 // finished (or under-feeds this watch) — stop instead of
                 // blocking the drive loop forever, so the test completes.
-                if tokio::time::timeout(std::time::Duration::from_millis(1500), notified).await.is_err() {
+                if tokio::time::timeout(std::time::Duration::from_millis(1500), notified)
+                    .await
+                    .is_err()
+                {
                     return None;
                 }
             } else {
@@ -312,7 +431,10 @@ impl ClientState {
     /// waiter that exists will read its side.
     pub fn resolve(&self, hash: &str, value: Value) {
         self.flight_settle(hash, Ok(value.clone()));
-        self.resolved.lock().unwrap().insert(hash.to_string(), value);
+        self.resolved
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), value);
         self.notify.notify_waiters();
     }
 
@@ -320,7 +442,10 @@ impl ClientState {
     /// single-flight on the same hash — see `resolve`.
     pub fn reject(&self, hash: &str, err: Value) {
         self.flight_settle(hash, Err(err.clone()));
-        self.rejections.lock().unwrap().insert(hash.to_string(), err);
+        self.rejections
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), err);
         self.notify.notify_waiters();
     }
 
@@ -374,7 +499,13 @@ impl ClientState {
                 true
             }
             None => {
-                fl.insert(hash.to_string(), FlightSlot { open: true, settled: None });
+                fl.insert(
+                    hash.to_string(),
+                    FlightSlot {
+                        open: true,
+                        settled: None,
+                    },
+                );
                 self.futures.lock().unwrap().insert(hash.to_string());
                 true
             }
@@ -384,12 +515,21 @@ impl ClientState {
     /// The flight's last outcome, if it has one. Does NOT consume it: every
     /// waiter must be able to observe the same result.
     pub fn flight_peek(&self, hash: &str) -> Option<Result<Value, Value>> {
-        self.flights.lock().unwrap().get(hash).and_then(|s| s.settled.clone())
+        self.flights
+            .lock()
+            .unwrap()
+            .get(hash)
+            .and_then(|s| s.settled.clone())
     }
 
     /// Whether a flight for `hash` exists and is still open.
     pub fn flight_is_open(&self, hash: &str) -> bool {
-        self.flights.lock().unwrap().get(hash).map(|s| s.open).unwrap_or(false)
+        self.flights
+            .lock()
+            .unwrap()
+            .get(hash)
+            .map(|s| s.open)
+            .unwrap_or(false)
     }
 
     /// Settle an open flight and wake its waiters. Returns false (and does
@@ -433,22 +573,53 @@ impl ClientState {
     /// Directly set a subscription entry (TS `client.subscriptions[h] = x`
     /// written from `handle_message`).
     pub fn set_subscription(&self, subscribe_hash: &str, subscription: Value) {
-        self.subscriptions.lock().unwrap().insert(subscribe_hash.to_string(), subscription);
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .insert(subscribe_hash.to_string(), subscription);
     }
 
     pub fn is_subscribed(&self, subscribe_hash: &str) -> bool {
-        self.subscriptions.lock().unwrap().contains_key(subscribe_hash)
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .contains_key(subscribe_hash)
     }
 
     pub fn send_text(&self, s: String) -> bool {
-        if std::env::var("CCXT_WS_DEBUG").is_ok() { eprintln!("[wssend] {}", s.chars().take(200).collect::<String>()); }
-        // Static-WS-test mock transport: record the frame (JSON-parsed, like the
-        // TS `client.connection.send` stub) instead of hitting a socket.
+        if std::env::var("CCXT_WS_DEBUG").is_ok() {
+            eprintln!("[wssend] {}", s.chars().take(200).collect::<String>());
+        }
+        if self.is_closed() {
+            return false;
+        }
+        if s.len() > MAX_PAYLOAD_BYTES {
+            self.fail("[NetworkError] outgoing payload exceeds limit".into());
+            return false;
+        }
+        // Fixture capture is bounded too; it does not consume a socket queue.
         if *self.mock.lock().unwrap() {
-            self.mock_sent.lock().unwrap().push(parse_text(&s));
+            let mut sent = self.mock_sent.lock().unwrap();
+            if sent.len() >= OUTGOING_CAPACITY {
+                drop(sent);
+                self.fail("[NetworkError] mock capture full".into());
+                return false;
+            }
+            let value = parse_text(&s);
+            let bytes = sent
+                .iter()
+                .fold(bounds::estimate_value_bytes(&value), |sum, item| {
+                    sum.saturating_add(bounds::estimate_value_bytes(item))
+                });
+            if bytes > OUTGOING_BYTES {
+                drop(sent);
+                self.fail("[NetworkError] mock capture byte budget exceeded".into());
+                return false;
+            }
+            sent.push(value);
             return true;
         }
-        self.outgoing.send(Message::Text(s)).is_ok()
+        self.send_message(Message::Text(s))
     }
 
     /// Enable the mock transport: mark connected (so `ensure_client` never opens
@@ -459,25 +630,18 @@ impl ClientState {
     }
     /// Injected inbound frame → the same queue the socket reader feeds.
     pub fn mock_inject(&self, msg: Value) {
-        self.incoming.lock().unwrap().push_back(msg);
-        self.notify.notify_one();
+        self.push_incoming(msg);
     }
 
     /// Inject a raw fixture through both the raw handoff and the drive queue, which is
     /// what the socket reader does for a real frame. Socket-less tests use this;
     /// production paths never call it.
     pub fn mock_inject_raw(&self, payload: Vec<u8>, is_binary: bool) {
-        let ingress_at = Instant::now();
-        self.observe_raw(payload.clone(), is_binary, ingress_at, now_ms());
-        let message = if is_binary {
-            parse_binary(&payload)
-        } else {
-            parse_text(std::str::from_utf8(&payload).unwrap_or_default())
-        };
-        self.incoming.lock().unwrap().push_back(message);
-        self.notify.notify_one();
+        self.receive_payload(payload, is_binary);
     }
-    pub fn is_mock(&self) -> bool { *self.mock.lock().unwrap() }
+    pub fn is_mock(&self) -> bool {
+        *self.mock.lock().unwrap()
+    }
     /// The captured outgoing frames as a `Value::List`.
     pub fn mock_sent_value(&self) -> Value {
         Value::Array(self.mock_sent.lock().unwrap().clone())
@@ -489,13 +653,19 @@ impl ClientState {
     pub fn has_queued_messages(&self) -> bool {
         !self.incoming.lock().unwrap().is_empty()
     }
-    pub fn mark_ws_test_completed(&self) { *self.ws_test_completed.lock().unwrap() = true; }
-    pub fn is_ws_test_completed(&self) -> bool { *self.ws_test_completed.lock().unwrap() }
+    pub fn mark_ws_test_completed(&self) {
+        *self.ws_test_completed.lock().unwrap() = true;
+    }
+    pub fn is_ws_test_completed(&self) -> bool {
+        *self.ws_test_completed.lock().unwrap()
+    }
     /// Reject every pending future so a fixture whose frames don't resolve the
     /// watch fails (with a message) rather than hanging the drive loop.
     pub fn reject_pending_futures(&self, err: Value) {
         let hashes: Vec<String> = self.futures.lock().unwrap().iter().cloned().collect();
-        for h in hashes { self.reject(&h, err.clone()); }
+        for h in hashes {
+            self.reject(&h, err.clone());
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -524,7 +694,7 @@ impl ClientState {
     pub fn subscriptions_value(&self) -> Value {
         let subs = self.subscriptions.lock().unwrap();
         let mut m = indexmap::IndexMap::new();
-        m.insert("__ws_subs_url".to_string(), Value::Str(self.url.clone()));
+        m.insert("__ws_subs_url".to_string(), Value::Str(self.reference()));
         for (h, sub) in subs.iter() {
             // Tag each subscription DICT with a back-reference so a field write
             // on it (`subscription['receivedSnapshot'] = true`) persists to this
@@ -533,8 +703,10 @@ impl ClientState {
             let tagged = match sub {
                 Value::Dict(d) => {
                     let mut inner = (**d).clone();
-                    inner.insert("__ws_sub_ref".to_string(),
-                        Value::Str(format!("{}\u{1}{}", self.url, h)));
+                    inner.insert(
+                        "__ws_sub_ref".to_string(),
+                        Value::Str(serde_json::to_string(&(self.reference(), h)).unwrap()),
+                    );
                     Value::Dict(std::sync::Arc::new(inner))
                 }
                 other => other.clone(),
@@ -549,7 +721,9 @@ impl ClientState {
     pub fn set_subscription_field(&self, hash: &str, key: &str, val: Value) {
         let mut subs = self.subscriptions.lock().unwrap();
         match subs.get_mut(hash) {
-            Some(Value::Dict(d)) => { std::sync::Arc::make_mut(d).insert(key.to_string(), val); }
+            Some(Value::Dict(d)) => {
+                std::sync::Arc::make_mut(d).insert(key.to_string(), val);
+            }
             _ => {
                 let mut inner = indexmap::IndexMap::new();
                 inner.insert(key.to_string(), val);
@@ -568,6 +742,7 @@ impl ClientState {
             // routes back to this ClientState — see value_resolve/value_reject.
             let mut fh = indexmap::IndexMap::new();
             fh.insert("url".to_string(), Value::Str(self.url.clone()));
+            fh.insert("__ws_reference".to_string(), Value::Str(self.reference()));
             fh.insert("__ws_future_hash".to_string(), Value::Str(h.clone()));
             m.insert(h.clone(), Value::Map(fh));
         }
@@ -578,7 +753,10 @@ impl ClientState {
 /// Get the existing client for `url`, or `None` if not yet connected.
 pub fn get_client(url: &str) -> Option<Arc<ClientState>> {
     let reg = REGISTRY.lock().unwrap();
-    reg.get(url).filter(|c| !c.is_closed()).cloned()
+    let caller = lifecycle::scope_id();
+    reg.get(url)
+        .filter(|c| !c.is_closed() && (caller == 0 || caller == c.scope_id))
+        .cloned()
 }
 
 /// Attach a raw observer to `url`.
@@ -587,7 +765,7 @@ pub fn get_client(url: &str) -> Option<Arc<ClientState>> {
 /// the first `watch*` call attaches the observer before the reader can deliver the
 /// first frame, and a later reconnect does not detach it.
 pub fn subscribe_raw(url: &str) -> broadcast::Receiver<RawFrame> {
-    raw_bus(url).sender.subscribe()
+    raw_bus(url)
 }
 
 /// Frames dropped on `url` because the bounded handoff was full. A lagging receiver
@@ -636,19 +814,25 @@ pub fn client_generation(url: &str) -> Option<u64> {
 /// `client.subscriptions[key] = val` written on a tagged snapshot — persist it
 /// to the live client so subsequent `handle_message` snapshots see it.
 pub fn value_subs_insert(url: &str, key: &str, val: Value) {
-    if let Some(c) = get_client(url) { c.set_subscription(key, val); }
+    if let Some(c) = client_from_reference(url) {
+        c.set_subscription(key, val);
+    }
 }
 
 /// `delete client.subscriptions[key]` on a tagged snapshot.
 pub fn value_subs_remove(url: &str, key: &str) {
-    if let Some(c) = get_client(url) { c.subscriptions.lock().unwrap().remove(key); }
+    if let Some(c) = client_from_reference(url) {
+        c.subscriptions.lock().unwrap().remove(key);
+    }
 }
 
 /// `client.subscriptions[hash][key] = val` written on a tagged subscription
-/// dict (carrying `__ws_sub_ref` = "url\u{1}hash").
+/// dict (carrying a JSON-encoded generation reference and subscription hash).
 pub fn value_sub_field_write(subref: &str, key: &str, val: Value) {
-    if let Some((url, hash)) = subref.split_once('\u{1}') {
-        if let Some(c) = get_client(url) { c.set_subscription_field(hash, key, val); }
+    if let Ok((reference, hash)) = serde_json::from_str::<(String, String)>(subref) {
+        if let Some(c) = client_from_reference(&reference) {
+            c.set_subscription_field(&hash, key, val);
+        }
     }
 }
 
@@ -660,14 +844,20 @@ pub fn value_sub_field_write(subref: &str, key: &str, val: Value) {
 async fn connect_via_proxy(
     url: &str,
     proxy: &str,
-) -> Result<tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, String> {
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let target = url::Url::parse(url).map_err(|e| format!("[NetworkError] ws url {url}: {e}"))?;
-    let host = target.host_str().ok_or_else(|| format!("[NetworkError] ws url {url} has no host"))?;
+    let host = target
+        .host_str()
+        .ok_or_else(|| format!("[NetworkError] ws url {url} has no host"))?;
     let port = target.port_or_known_default().unwrap_or(443);
     let p = url::Url::parse(proxy).map_err(|e| format!("[NetworkError] ws proxy {proxy}: {e}"))?;
-    let p_host = p.host_str().ok_or_else(|| format!("[NetworkError] ws proxy {proxy} has no host"))?;
+    let p_host = p
+        .host_str()
+        .ok_or_else(|| format!("[NetworkError] ws proxy {proxy} has no host"))?;
     let p_port = p.port_or_known_default().unwrap_or(8080);
     let mut stream = tokio::net::TcpStream::connect((p_host, p_port))
         .await
@@ -687,113 +877,153 @@ async fn connect_via_proxy(
             .await
             .map_err(|e| format!("[NetworkError] ws proxy CONNECT {proxy}: {e}"))?;
         if n == 0 {
-            return Err(format!("[NetworkError] ws proxy {proxy} closed during CONNECT"));
+            return Err(format!(
+                "[NetworkError] ws proxy {proxy} closed during CONNECT"
+            ));
         }
         head.push(byte[0]);
         if head.len() > 8192 {
-            return Err(format!("[NetworkError] ws proxy {proxy} sent an oversized CONNECT reply"));
+            return Err(format!(
+                "[NetworkError] ws proxy {proxy} sent an oversized CONNECT reply"
+            ));
         }
     }
     let status = String::from_utf8_lossy(&head);
     let first = status.lines().next().unwrap_or_default();
     if !first.contains(" 200") {
-        return Err(format!("[NetworkError] ws proxy {proxy} refused CONNECT: {first}"));
+        return Err(format!(
+            "[NetworkError] ws proxy {proxy} refused CONNECT: {first}"
+        ));
     }
-    let (ws, _resp) = tokio_tungstenite::client_async_tls(url, stream)
-        .await
-        .map_err(|e| format!("[NetworkError] ws connect {url} via {proxy}: {e}"))?;
+    let (ws, _resp) =
+        tokio_tungstenite::client_async_tls_with_config(url, stream, Some(socket_config()), None)
+            .await
+            .map_err(|e| format!("[NetworkError] ws connect {url} via {proxy}: {e}"))?;
     Ok(ws)
+}
+
+fn socket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_PAYLOAD_BYTES),
+        max_frame_size: Some(MAX_PAYLOAD_BYTES),
+        write_buffer_size: 0,
+        max_write_buffer_size: OUTGOING_BYTES,
+        ..Default::default()
+    }
 }
 
 pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<ClientState>, String> {
     let state = ensure_slot(url);
-    if *state.connected.lock().unwrap() {
-        return Ok(state);
-    }
-    // Serialize connect; re-check under the gate (another task may have just
-    // connected this slot). Lock via a cloned Arc so `state` stays movable.
     let gate_holder = state.clone();
     let _gate = gate_holder.connect_gate.lock().await;
+    let closing = gate_holder.close_notify.notified();
+    if state.is_closed() {
+        return Err("[NetworkError] client closed before connect".into());
+    }
     if *state.connected.lock().unwrap() {
         return Ok(state);
     }
-    let ws = match proxy.as_deref().filter(|p| !p.is_empty()) {
-        Some(p) => connect_via_proxy(url, p).await?,
-        None => {
-            let (ws, _resp) = tokio_tungstenite::connect_async(url)
+    let connect = async {
+        match proxy.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => connect_via_proxy(url, p).await,
+            None => tokio_tungstenite::connect_async_with_config(url, Some(socket_config()), false)
                 .await
-                .map_err(|e| format!("[NetworkError] ws connect {url}: {e}"))?;
-            ws
+                .map(|(ws, _)| ws)
+                .map_err(|e| format!("[NetworkError] ws connect: {e}")),
         }
     };
-    let (mut write, mut read) = ws.split();
-    let mut rx = state.pending_rx.lock().unwrap().take()
-        .ok_or_else(|| format!("[NetworkError] ws {url} slot has no writer channel"))?;
-    *state.last_pong_ms.lock().unwrap() = now_ms();
-
-    // Writer task: drain the outgoing queue to the socket.
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write.send(msg).await.is_err() {
-                break;
-            }
+    let ws = tokio::select! {
+        biased;
+        _ = closing => return Err("[NetworkError] client closed during connect".into()),
+        result = tokio::time::timeout(std::time::Duration::from_secs(30), connect) => {
+            result.map_err(|_| "[NetworkError] connect deadline exceeded".to_owned())??
         }
-        let _ = write.close().await;
-    });
-
-    // Reader task: decode frames → incoming queue.
-    let st = state.clone();
-    tokio::spawn(async move {
+    };
+    // Register all handles atomically with respect to request_close. A close
+    // racing this region either rejects startup or sees every spawned handle.
+    let mut tasks = state.tasks.lock().unwrap();
+    if state.is_closed() {
+        return Err("[NetworkError] client closed during connect".into());
+    }
+    let (mut write, mut read) = ws.split();
+    let mut rx = state
+        .pending_rx
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| "[NetworkError] slot has no writer channel".to_owned())?;
+    *state.last_pong_ms.lock().unwrap() = now_ms();
+    *state.connected.lock().unwrap() = true;
+    let writer_state = state.clone();
+    tasks.handles.push(tokio::spawn(async move {
+        let _exit = TaskExit(writer_state.clone());
+        while let Some(outgoing) = rx.recv().await {
+            if let Err(error) = write.send(outgoing.message).await {
+                writer_state.fail_with_source(
+                    socket_failure_source(&error),
+                    format!("[NetworkError] writer: {error}"),
+                );
+                return;
+            }
+            // The permit includes the in-flight write, not just queue residency.
+            drop(outgoing._permit);
+        }
+        writer_state.request_close();
+    }));
+    let reader_state = state.clone();
+    tasks.handles.push(tokio::spawn(async move {
+        let _exit = TaskExit(reader_state.clone());
         while let Some(frame) = read.next().await {
             match frame {
-                Ok(Message::Text(t)) => {
-                    let ingress_at = Instant::now();
-                    st.observe_raw(t.to_string().into_bytes(), false, ingress_at, now_ms());
-                    st.push_incoming(parse_text(&t));
+                Ok(Message::Text(text)) => reader_state.receive_payload(text.into_bytes(), false),
+                Ok(Message::Binary(bytes)) => reader_state.receive_payload(bytes, true),
+                Ok(Message::Pong(_)) => reader_state.on_pong(),
+                Ok(Message::Ping(bytes)) => {
+                    reader_state.send_message(Message::Pong(bytes));
                 }
-                Ok(Message::Binary(b)) => {
-                    let ingress_at = Instant::now();
-                    st.observe_raw(b.to_vec(), true, ingress_at, now_ms());
-                    st.push_incoming(parse_binary(&b));
+                Ok(Message::Close(_)) => {
+                    reader_state.request_close();
+                    return;
                 }
-                Ok(Message::Pong(_)) => st.on_pong(),
-                // tungstenite answers Ping frames with Pong automatically.
-                Ok(Message::Ping(_)) => {}
-                Ok(Message::Close(_)) | Err(_) => break,
+                Err(error) => {
+                    reader_state.fail_with_source(
+                        socket_failure_source(&error),
+                        format!("[NetworkError] reader: {error}"),
+                    );
+                    return;
+                }
                 _ => {}
             }
+            if reader_state.is_closed() {
+                return;
+            }
         }
-        *st.connected.lock().unwrap() = false;
-        *st.closed.lock().unwrap() = true;
-        st.notify.notify_waiters();
-    });
-
-    // Keep-alive: an unsolicited Ping every 30s; the peer's Pong updates
-    // last_pong. (Full miss-count RequestTimeout handling is a later refinement.)
-    let st2 = state.clone();
-    tokio::spawn(async move {
-        let mut iv = tokio::time::interval(std::time::Duration::from_secs(30));
-        iv.tick().await; // first tick fires immediately; skip it
+        reader_state.fail_with_source(
+            ScopeFailureSource::TransportTerminal,
+            "[NetworkError] reader reached EOF".into(),
+        );
+    }));
+    let keepalive_state = state.clone();
+    tasks.handles.push(tokio::spawn(async move {
+        let _exit = TaskExit(keepalive_state.clone());
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
         loop {
-            iv.tick().await;
-            if st2.is_closed() {
-                break;
-            }
-            if st2.outgoing.send(Message::Ping(Vec::new())).is_err() {
-                break;
+            interval.tick().await;
+            if !keepalive_state.send_message(Message::Ping(Vec::new())) {
+                return;
             }
         }
-    });
-
-    *state.connected.lock().unwrap() = true;
+    }));
+    drop(tasks);
     Ok(state)
 }
 
 /// Live read of a client handle's `subscriptions` / `futures` field, straight
 /// from the registry so a read after a write (upbit builds its subscribe frame
 /// from subscriptions it just set) is coherent, not a stale embedded snapshot.
-pub fn client_field_live(url: &str, field: &str) -> Value {
-    match get_client(url) {
+pub fn client_field_live(reference: &str, field: &str) -> Value {
+    match client_from_reference(reference) {
         Some(c) if field == "futures" => c.futures_value(),
         Some(c) => c.subscriptions_value(),
         None => Value::Map(indexmap::IndexMap::new()),
@@ -803,19 +1033,23 @@ pub fn client_field_live(url: &str, field: &str) -> Value {
 /// Get-or-create the registry slot for `url` WITHOUT connecting the socket, so
 /// `client.subscriptions` written before `watch()` connects still persist.
 fn ensure_slot(url: &str) -> Arc<ClientState> {
-    let mut reg = REGISTRY.lock().unwrap();
-    if let Some(c) = reg.get(url) {
-        if !c.is_closed() {
-            return c.clone();
-        }
-    }
-    let (tx, rx) = mpsc::unbounded_channel::<Message>();
-    let state = Arc::new(ClientState {
+    lifecycle::acquire_slot(url)
+}
+
+fn new_slot(url: &str, scope_id: u64) -> Arc<ClientState> {
+    let (tx, rx) = mpsc::channel(OUTGOING_CAPACITY);
+    Arc::new(ClientState {
         url: url.to_string(),
         outgoing: tx,
+        outgoing_budget: Arc::new(tokio::sync::Semaphore::new(OUTGOING_BYTES)),
+        scope_id,
+        tasks: Mutex::new(lifecycle::Tasks::default()),
+        join_gate: tokio::sync::Mutex::new(()),
+        close_notify: Notify::new(),
+        error: Mutex::new(None),
         pending_rx: Mutex::new(Some(rx)),
         connect_gate: tokio::sync::Mutex::new(()),
-        incoming: Mutex::new(VecDeque::new()),
+        incoming: Mutex::new(ParsedQueue::default()),
         generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         notify: Notify::new(),
         resolved: Mutex::new(HashMap::new()),
@@ -829,14 +1063,27 @@ fn ensure_slot(url: &str) -> Arc<ClientState> {
         mock: Mutex::new(false),
         mock_sent: Mutex::new(Vec::new()),
         ws_test_completed: Mutex::new(false),
-    });
-    reg.insert(url.to_string(), state.clone());
-    state
+    })
 }
 
-/// Remove (and thereby drop / disconnect) the client for `url`.
+/// Request cancellation and remove a matching caller-owned slot. This synchronous
+/// operation is not join evidence; hold the Arc and call close_and_join for that.
 pub fn drop_client(url: &str) {
-    REGISTRY.lock().unwrap().remove(url);
+    let client = {
+        let mut registry = REGISTRY.lock().unwrap();
+        if registry
+            .get(url)
+            .is_some_and(|c| c.scope_id == lifecycle::scope_id())
+        {
+            registry.remove(url)
+        } else {
+            None
+        }
+    };
+    if let Some(client) = client {
+        client.request_close();
+    }
+    reclaim_raw_buses();
 }
 
 // ── `Value`-handle bridge ────────────────────────────────────────────────────
@@ -862,22 +1109,35 @@ pub fn mock_setup(url: &str) {
     *c.ws_test_completed.lock().unwrap() = false;
 }
 pub fn mock_inject(url: &str, msg: Value) {
-    if let Some(c) = get_client(url) { c.mock_inject(msg); }
+    if let Some(c) = get_client(url) {
+        c.mock_inject(msg);
+    }
 }
 pub fn mock_sent_messages(url: &str) -> Value {
-    match get_client(url) { Some(c) => c.mock_sent_value(), None => Value::Array(vec![]) }
+    match get_client(url) {
+        Some(c) => c.mock_sent_value(),
+        None => Value::Array(vec![]),
+    }
 }
 pub fn mock_has_pending_futures(url: &str) -> bool {
-    get_client(url).map(|c| c.has_pending_futures()).unwrap_or(false)
+    get_client(url)
+        .map(|c| c.has_pending_futures())
+        .unwrap_or(false)
 }
 pub fn mock_has_queued_messages(url: &str) -> bool {
-    get_client(url).map(|c| c.has_queued_messages()).unwrap_or(false)
+    get_client(url)
+        .map(|c| c.has_queued_messages())
+        .unwrap_or(false)
 }
 pub fn mock_mark_completed(url: &str) {
-    if let Some(c) = get_client(url) { c.mark_ws_test_completed(); }
+    if let Some(c) = get_client(url) {
+        c.mark_ws_test_completed();
+    }
 }
 pub fn mock_is_completed(url: &str) -> bool {
-    get_client(url).map(|c| c.is_ws_test_completed()).unwrap_or(true)
+    get_client(url)
+        .map(|c| c.is_ws_test_completed())
+        .unwrap_or(true)
 }
 pub fn mock_reject_futures(url: &str) {
     if let Some(c) = get_client(url) {
@@ -895,6 +1155,7 @@ pub fn client_value(url: &str) -> Value {
     let c = ensure_slot(url);
     let mut m = indexmap::IndexMap::new();
     m.insert("url".to_string(), Value::Str(url.to_string()));
+    m.insert("__ws_reference".to_string(), Value::Str(c.reference()));
     m.insert("subscriptions".to_string(), c.subscriptions_value());
     m.insert("futures".to_string(), c.futures_value());
     Value::Map(m)
@@ -908,14 +1169,21 @@ pub fn begin_flight(url: &str, hash: &str) -> bool {
     ensure_slot(url).flight_begin(hash)
 }
 
-
 /// The `Value` a `client.future ()` / `client.reusableFuture ()` call hands
 /// back: enough to find the flight again (its client's url + the hash). TS
 /// returns a real Future object; a `Value` can't hold one, so the port returns
 /// a handle and `ws_await_flight` does the awaiting.
 pub fn flight_handle(url: &str, hash: &str, led: bool) -> Value {
+    let Some(client) = get_client(url) else {
+        return Value::Null;
+    };
+    flight_handle_for(&client, hash, led)
+}
+
+fn flight_handle_for(client: &ClientState, hash: &str, led: bool) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("url".to_string(), Value::Str(url.to_string()));
+    m.insert("url".to_string(), Value::Str(client.url.clone()));
+    m.insert("__ws_reference".to_string(), Value::Str(client.reference()));
     m.insert("__ws_flight_hash".to_string(), Value::Str(hash.to_string()));
     // Whether the call that produced this handle opened the flight. A leader
     // settles its own flight (and TS's `await future` resolves the instant it
@@ -948,7 +1216,7 @@ pub async fn ws_await_flight(handle: &Value) -> Value {
         (Some(u), Some(h)) => (u, h),
         _ => return Value::Null,
     };
-    let client = match get_client(&url) {
+    let client = match client_from_handle(handle) {
         Some(c) => c,
         None => return Value::Null,
     };
@@ -1027,21 +1295,54 @@ fn hash_str(v: &Value) -> Option<String> {
     }
 }
 
-/// `client.resolve(value, messageHash)` routed by URL. Returns `value`.
+impl ClientState {
+    fn reference(&self) -> String {
+        serde_json::to_string(&(self.scope_id, self.generation, &self.url)).unwrap()
+    }
+}
+
+fn client_from_reference(reference: &str) -> Option<Arc<ClientState>> {
+    let (scope, generation, url): (u64, u64, String) = serde_json::from_str(reference).ok()?;
+    if scope != lifecycle::scope_id() {
+        return None;
+    }
+    // Return the matched Arc, not a URL to look up again after the check.
+    let registry = REGISTRY.lock().unwrap();
+    registry
+        .get(&url)
+        .filter(|client| {
+            client.scope_id == scope && client.generation == generation && !client.is_closed()
+        })
+        .cloned()
+}
+
+fn client_from_handle(handle: &Value) -> Option<Arc<ClientState>> {
+    match crate::get_value(handle, &Value::Str("__ws_reference".to_owned())) {
+        Value::Str(reference) => client_from_reference(&reference),
+        _ => None,
+    }
+}
+
+/// Open a flight only on the exact client generation named by a Value handle.
+pub fn value_open_flight(handle: &Value, hash: Value) -> Value {
+    let Value::Str(ref name) = hash else {
+        return hash;
+    };
+    let Some(client) = client_from_handle(handle) else {
+        return hash;
+    };
+    let leader = client.flight_begin(name);
+    flight_handle_for(&client, name, leader)
+}
+
+/// `client.resolve(value, messageHash)` routed to an exact generation.
 pub fn value_resolve(client: &Value, args: &[Value]) -> Value {
     let value = args.get(0).cloned().unwrap_or(Value::Null);
-    // `client.futures[hash].resolve(value)` — the future handle carries its own
-    // hash, so there is no second arg. Resolve that hash.
-    if let Some(hash) = future_hash_of(client) {
-        if let Some(url) = url_of(client) {
-            if let Some(c) = get_client(&url) { c.resolve(&hash, value.clone()); }
-        }
-        return value;
-    }
-    if let (Some(url), Some(hash)) = (url_of(client), args.get(1).and_then(hash_str)) {
-        if let Some(c) = get_client(&url) {
-            c.resolve(&hash, value.clone());
-        }
+    if let (Some(owner), Some(hash)) = (
+        client_from_handle(client),
+        future_hash_of(client).or_else(|| args.get(1).and_then(hash_str)),
+    ) {
+        owner.resolve(&hash, value.clone());
     }
     value
 }
@@ -1054,64 +1355,43 @@ fn future_hash_of(client: &Value) -> Option<String> {
     }
 }
 
-/// `client.reject(error, messageHash)` routed by URL.
+/// `client.reject(error, messageHash)` routed to an exact generation.
 pub fn value_reject(client: &Value, args: &[Value]) -> Value {
-    let err = args.get(0).cloned().unwrap_or(Value::Null);
-    // `client.futures[hash].reject(error)` — future handle carries its own hash.
-    if let Some(hash) = future_hash_of(client) {
-        if let Some(url) = url_of(client) {
-            if let Some(c) = get_client(&url) { c.reject(&hash, err.clone()); }
-        }
-        return err;
-    }
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            match args.get(1).and_then(hash_str) {
-                Some(hash) => c.reject(&hash, err.clone()),
-                // reject with no hash → reject every pending future.
-                None => {
-                    let hashes: Vec<String> = c.futures.lock().unwrap().iter().cloned().collect();
-                    for h in hashes {
-                        c.reject(&h, err.clone());
-                    }
-                }
-            }
+    let error = args.get(0).cloned().unwrap_or(Value::Null);
+    if let Some(owner) = client_from_handle(client) {
+        match future_hash_of(client).or_else(|| args.get(1).and_then(hash_str)) {
+            Some(hash) => owner.reject(&hash, error.clone()),
+            None => owner.reject_pending_futures(error.clone()),
         }
     }
-    err
+    error
 }
 
-/// `client.send(message)` routed by URL. Serialises non-string payloads to JSON.
+/// `client.send(message)` routed to an exact generation.
 pub fn value_send(client: &Value, args: &[Value]) -> Value {
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            let payload = match args.get(0) {
-                Some(Value::Str(s)) => s.clone(),
-                Some(v) => v.to_json().to_string(),
-                None => String::new(),
-            };
-            c.send_text(payload);
-        }
+    if let Some(owner) = client_from_handle(client) {
+        let payload = match args.get(0) {
+            Some(Value::Str(value)) => value.clone(),
+            Some(value) => value.to_json().to_string(),
+            None => String::new(),
+        };
+        owner.send_text(payload);
     }
     Value::Null
 }
 
-/// `client.reset(...)` routed by URL.
+/// `client.reset(...)` routed to an exact generation.
 pub fn value_reset(client: &Value) -> Value {
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            c.reset();
-        }
+    if let Some(owner) = client_from_handle(client) {
+        owner.reset();
     }
     Value::Null
 }
 
-/// `client.on_pong(...)` routed by URL.
+/// `client.on_pong(...)` routed to an exact generation.
 pub fn value_on_pong(client: &Value) -> Value {
-    if let Some(url) = url_of(client) {
-        if let Some(c) = get_client(&url) {
-            c.on_pong();
-        }
+    if let Some(owner) = client_from_handle(client) {
+        owner.on_pong();
     }
     Value::Null
 }
@@ -1137,7 +1417,9 @@ mod tests {
                 }
                 // Stream three ticker updates.
                 for px in ["100.5", "101.0", "101.5"] {
-                    let msg = format!("{{\"channel\":\"ticker\",\"symbol\":\"BTC/USDT\",\"last\":\"{px}\"}}");
+                    let msg = format!(
+                        "{{\"channel\":\"ticker\",\"symbol\":\"BTC/USDT\",\"last\":\"{px}\"}}"
+                    );
                     ws.send(WsMessage::Text(msg)).await.unwrap();
                 }
                 // Give the client time to drain before closing.
@@ -1262,7 +1544,10 @@ mod tests {
         let url = "flight-test-election";
         let c = ensure_slot(url);
         assert!(c.flight_begin("authenticate:future"), "first caller leads");
-        assert!(!c.flight_begin("authenticate:future"), "second caller follows");
+        assert!(
+            !c.flight_begin("authenticate:future"),
+            "second caller follows"
+        );
         // The follower's `messageHash in client.futures` test must see it.
         assert!(in_op_futures(&c, "authenticate:future"));
         drop_client(url);
@@ -1305,7 +1590,10 @@ mod tests {
         let started = std::time::Instant::now();
         let got = ws_await_flight(&flight_handle(url, "auth", false)).await;
         assert_eq!(got, Value::Str("late".to_string()));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(50), "waited for the leader");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "waited for the leader"
+        );
         settler.await.unwrap();
         drop_client(url);
     }
@@ -1324,7 +1612,10 @@ mod tests {
             ws_await_flight(&flight_handle(url, "authenticated", led)).await,
             Value::Null
         );
-        assert!(started.elapsed() < std::time::Duration::from_millis(200), "returned at once");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "returned at once"
+        );
         // Having led once and settled, the value is still there for a re-await.
         c.resolve("authenticated", Value::Bool(true));
         let led2 = c.flight_begin("authenticated");
@@ -1342,7 +1633,10 @@ mod tests {
         // wanted is already in the venue's own cache.
         let url = "flight-test-missing";
         ensure_slot(url);
-        assert_eq!(ws_await_flight(&flight_handle(url, "nope", false)).await, Value::Null);
+        assert_eq!(
+            ws_await_flight(&flight_handle(url, "nope", false)).await,
+            Value::Null
+        );
         drop_client(url);
     }
 
