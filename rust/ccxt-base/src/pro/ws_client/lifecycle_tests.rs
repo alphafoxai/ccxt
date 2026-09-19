@@ -16,6 +16,150 @@ async fn server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
+async fn first_terminal_message_cannot_hide_later_fatal_source() {
+    for internal_first in [false, true] {
+        let (url, peer) = server().await;
+        let scope = ClientScope::new();
+        let client = scope.run(ensure_client(&url, None)).await.unwrap();
+        if internal_first {
+            client.fail("budget failure".into());
+        }
+        client.fail_with_source(
+            ScopeFailureSource::TransportTerminal,
+            "transport failure".into(),
+        );
+        for _ in 0..100 {
+            client.fail("budget failure".into());
+        }
+        let report = scope.close_and_join(BOUND).await;
+        assert!(
+            report.cleanup_complete && !report.all_joined(),
+            "{report:?}"
+        );
+        assert!(report
+            .failures
+            .iter()
+            .any(|f| f.source == ScopeFailureSource::Internal && f.message == "budget failure"));
+        assert_eq!(report.failures.len(), if internal_first { 1 } else { 2 });
+        assert_eq!(
+            client.terminal_error().as_deref(),
+            Some(if internal_first {
+                "budget failure"
+            } else {
+                "transport failure"
+            })
+        );
+        tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transport_terminal_cannot_hide_awaited_task_panics() {
+    let (url, peer) = server().await;
+    let scope = ClientScope::new();
+    let client = scope.run(ensure_client(&url, None)).await.unwrap();
+    for _ in 0..2 {
+        let task = tokio::spawn(async { panic!("mixed-cause panic") });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        client.tasks.lock().unwrap().handles.push(task);
+    }
+    client.fail_with_source(
+        ScopeFailureSource::TransportTerminal,
+        "transport failure".into(),
+    );
+    let report = scope.close_and_join(BOUND).await;
+    assert!(
+        report.cleanup_complete && !report.all_joined(),
+        "{report:?}"
+    );
+    assert_eq!(
+        report
+            .failures
+            .iter()
+            .filter(|f| f.source == ScopeFailureSource::TaskPanic)
+            .count(),
+        2
+    );
+    assert!(report
+        .failures
+        .iter()
+        .any(|f| f.source == ScopeFailureSource::TransportTerminal));
+    tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
+}
+
+#[test]
+fn typed_socket_failure_sources_never_inspect_text() {
+    use tokio_tungstenite::tungstenite::{
+        error::{CapacityError, ProtocolError},
+        Error,
+    };
+    for error in [
+        Error::ConnectionClosed,
+        Error::AlreadyClosed,
+        Error::Io(std::io::Error::other("arbitrary text")),
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+    ] {
+        assert_eq!(
+            socket_failure_source(&error),
+            ScopeFailureSource::TransportTerminal
+        );
+    }
+    for error in [
+        Error::Utf8,
+        Error::Capacity(CapacityError::MessageTooLong {
+            size: 2,
+            max_size: 1,
+        }),
+        Error::Protocol(ProtocolError::UnmaskedFrameFromClient),
+    ] {
+        assert_eq!(socket_failure_source(&error), ScopeFailureSource::Internal);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_transport_and_decoder_failure_retain_internal() {
+    let (url, peer) = server().await;
+    let scope = ClientScope::new();
+    let client = scope.run(ensure_client(&url, None)).await.unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    // Both caller-owned operations have passed the open check. Freeze the
+    // decoder result before racing its fail call with a transport terminal.
+    let invalid = bounds::decode(&vec![0; MAX_PAYLOAD_BYTES + 1], false).unwrap_err();
+    let transport_client = Arc::clone(&client);
+    let transport_barrier = Arc::clone(&barrier);
+    let transport = tokio::task::spawn_blocking(move || {
+        transport_barrier.wait();
+        transport_client.fail_with_source(
+            ScopeFailureSource::TransportTerminal,
+            "transport failure".into(),
+        );
+    });
+    let decoder_client = Arc::clone(&client);
+    let decoder = tokio::task::spawn_blocking(move || {
+        barrier.wait();
+        decoder_client.fail(invalid);
+    });
+    tokio::time::timeout(BOUND, async {
+        transport.await.unwrap();
+        decoder.await.unwrap();
+    })
+    .await
+    .unwrap();
+    let report = scope.close_and_join(BOUND).await;
+    assert!(
+        report.cleanup_complete && !report.all_joined(),
+        "{report:?}"
+    );
+    assert!(report
+        .failures
+        .iter()
+        .any(|f| f.source == ScopeFailureSource::Internal));
+    tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn scoped_join_observes_three_tasks_and_peer_eof() {
     let (url, peer) = server().await;
     let scope = ClientScope::new();
@@ -222,6 +366,7 @@ async fn outgoing_frame_count_and_bytes_are_independent_terminal_limits() {
         let terminal = scope.close_and_join(BOUND).await;
         assert!(!terminal.all_joined());
         assert!(terminal.cleanup_complete, "{terminal:?}");
+        assert_eq!(terminal.failures[0].source, ScopeFailureSource::Internal);
     }
 }
 
@@ -323,6 +468,7 @@ async fn socket_rejects_fragmented_aggregate_over_wire_limit() {
     assert_eq!(report.tasks_joined, 3);
     assert!(!report.all_joined() && !report.timed_out);
     assert!(report.cleanup_complete, "{report:?}");
+    assert_eq!(report.failures[0].source, ScopeFailureSource::Internal);
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
 }
 
@@ -341,7 +487,8 @@ async fn internal_panic_is_joined_but_not_reported_as_success() {
     assert_eq!(report.tasks_joined, 1);
     assert!(!report.all_joined() && !report.timed_out);
     assert!(report.cleanup_complete, "{report:?}");
-    assert!(report.failures[0].contains("panic"));
+    assert!(report.failures[0].message.contains("panic"));
+    assert_eq!(report.failures[0].source, ScopeFailureSource::TaskPanic);
 }
 
 #[tokio::test]

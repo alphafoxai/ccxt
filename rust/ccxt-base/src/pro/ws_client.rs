@@ -23,7 +23,7 @@ mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
 use bounds::{ParsedQueue, MAX_PAYLOAD_BYTES, OUTGOING_BYTES, OUTGOING_CAPACITY};
-pub use lifecycle::{ClientScope, ScopeJoinReport};
+pub use lifecycle::{ClientScope, ScopeFailure, ScopeFailureSource, ScopeJoinReport};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -50,7 +50,7 @@ pub struct ClientState {
     tasks: Mutex<lifecycle::Tasks>,
     join_gate: tokio::sync::Mutex<()>,
     close_notify: Notify,
-    error: Mutex<Option<String>>,
+    error: Mutex<Option<ScopeFailure>>,
     /// Receiver half held until the socket connects (a slot is pre-registered
     /// before connecting so `client.subscriptions` writes persist — upbit builds
     /// its subscribe frame from subscriptions set before the socket is up). The
@@ -113,6 +113,19 @@ const MAX_RAW_URLS: usize = 256;
 struct Outgoing {
     message: Message,
     _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn socket_failure_source(error: &tokio_tungstenite::tungstenite::Error) -> ScopeFailureSource {
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
+    match error {
+        Error::Io(_)
+        | Error::ConnectionClosed
+        | Error::AlreadyClosed
+        | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            ScopeFailureSource::TransportTerminal
+        }
+        _ => ScopeFailureSource::Internal,
+    }
 }
 
 struct TaskExit(Arc<ClientState>);
@@ -946,7 +959,10 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
         let _exit = TaskExit(writer_state.clone());
         while let Some(outgoing) = rx.recv().await {
             if let Err(error) = write.send(outgoing.message).await {
-                writer_state.fail(format!("[NetworkError] writer: {error}"));
+                writer_state.fail_with_source(
+                    socket_failure_source(&error),
+                    format!("[NetworkError] writer: {error}"),
+                );
                 return;
             }
             // The permit includes the in-flight write, not just queue residency.
@@ -970,7 +986,10 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
                     return;
                 }
                 Err(error) => {
-                    reader_state.fail(format!("[NetworkError] reader: {error}"));
+                    reader_state.fail_with_source(
+                        socket_failure_source(&error),
+                        format!("[NetworkError] reader: {error}"),
+                    );
                     return;
                 }
                 _ => {}
@@ -979,7 +998,10 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
                 return;
             }
         }
-        reader_state.fail("[NetworkError] reader reached EOF".into());
+        reader_state.fail_with_source(
+            ScopeFailureSource::TransportTerminal,
+            "[NetworkError] reader reached EOF".into(),
+        );
     }));
     let keepalive_state = state.clone();
     tasks.handles.push(tokio::spawn(async move {

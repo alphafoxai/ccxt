@@ -93,7 +93,7 @@ impl ClientScope {
                 report.cleanup_complete = false;
             }
             drop(tasks);
-            if let Some(error) = client.terminal_error() {
+            if let Some(error) = client.error.lock().unwrap().clone() {
                 report.failures.push(error);
             }
             if !report.timed_out {
@@ -130,12 +130,25 @@ impl Drop for ClientScope {
 /// handles or a lock-wait timeout all force `cleanup_complete == false`.
 /// An empty scope is vacuously complete, but that only covers fork-held
 /// internal tasks; caller-owned connect/watch futures need separate proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeFailureSource {
+    TransportTerminal,
+    TaskPanic,
+    Internal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeFailure {
+    pub source: ScopeFailureSource,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScopeJoinReport {
     pub clients: usize,
     pub tasks_joined: usize,
     pub timed_out: bool,
-    pub failures: Vec<String>,
+    pub failures: Vec<ScopeFailure>,
     pub cleanup_complete: bool,
 }
 impl ScopeJoinReport {
@@ -149,7 +162,7 @@ impl ScopeJoinReport {
 pub(super) struct Tasks {
     pub handles: Vec<tokio::task::JoinHandle<()>>,
     pub joined: usize,
-    pub failures: Vec<String>,
+    pub failures: Vec<ScopeFailure>,
 }
 impl Drop for Tasks {
     fn drop(&mut self) {
@@ -243,10 +256,40 @@ impl ClientState {
     }
     /// The first terminal transport/budget failure, if any.
     pub fn terminal_error(&self) -> Option<String> {
-        self.error.lock().unwrap().clone()
+        self.error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|error| error.message.clone())
     }
     pub(super) fn fail(&self, message: String) {
-        self.error.lock().unwrap().get_or_insert(message);
+        self.fail_with_source(ScopeFailureSource::Internal, message);
+    }
+    pub(super) fn fail_with_source(&self, source: ScopeFailureSource, message: String) {
+        {
+            // Atomic first-terminal + fatal-retention decision. No path holds
+            // error while acquiring tasks; release both before request_close.
+            let mut tasks = self.tasks.lock().unwrap();
+            let mut terminal = self.error.lock().unwrap();
+            let failure = ScopeFailure { source, message };
+            if let Some(first) = terminal.as_ref() {
+                // Preserve the first message API, but never let an earlier
+                // transport error hide a racing decoder/budget failure. At most
+                // one suppressed Internal per client; actual JoinErrors below
+                // are always appended, never deduplicated.
+                if first.source != source
+                    && source == ScopeFailureSource::Internal
+                    && !tasks
+                        .failures
+                        .iter()
+                        .any(|f| f.source == ScopeFailureSource::Internal)
+                {
+                    tasks.failures.push(failure);
+                }
+            } else {
+                *terminal = Some(failure);
+            }
+        }
         self.incoming.lock().unwrap().clear();
         self.request_close();
     }
@@ -264,7 +307,14 @@ impl ClientState {
                         tasks.joined += 1;
                         if let Err(error) = result {
                             if !error.is_cancelled() {
-                                tasks.failures.push(error.to_string());
+                                tasks.failures.push(ScopeFailure {
+                                    source: if error.is_panic() {
+                                        ScopeFailureSource::TaskPanic
+                                    } else {
+                                        ScopeFailureSource::Internal
+                                    },
+                                    message: error.to_string(),
+                                });
                             }
                         }
                     }
@@ -294,7 +344,7 @@ impl ClientState {
             cleanup_complete: !timed_out && tasks.handles.is_empty(),
         };
         drop(tasks);
-        if let Some(error) = self.terminal_error() {
+        if let Some(error) = self.error.lock().unwrap().clone() {
             report.failures.push(error);
         }
         if !timed_out {

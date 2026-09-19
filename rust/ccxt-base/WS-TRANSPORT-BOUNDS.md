@@ -27,6 +27,17 @@ failure and is unchanged: terminal transport errors keep `cleanup_complete`
 true while `all_joined()` stays false. Aborted **and awaited** reader/writer/keepalive tasks count as joined: this
 proves task destruction, not a graceful WebSocket close handshake.
 
+Failures are typed `ScopeFailure { source, message }`, preserving the original text.
+`TransportTerminal` is assigned only at EOF or for tungstenite I/O, closed/already-closed,
+and reset-without-closing-handshake variants. Budget, decoder, UTF-8, capacity, other
+protocol and unknown errors are `Internal`; awaited task panics are `TaskPanic`.
+No classification parses error text. The first terminal message remains available via
+`terminal_error()`. A racing later Internal cannot be hidden by that first message:
+one suppressed Internal per client is retained in `Tasks.failures`; actual non-cancelled
+JoinErrors are always appended. This is bounded fatal-cause evidence, not a complete
+per-error audit. Record locking is tasks → error; both are released before cancellation.
+Consumers must inspect every failure independently of cleanup proof.
+
 `request_close`, `drop_client`, and scope Drop only request cancellation. They must
 not be presented as join proof. Join handles remain inside `ClientState` across
 cancelled/timed-out join futures, so a retained scope/client can retry. Dropping the
@@ -94,8 +105,11 @@ cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --all-
 cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --features transpiled-base --all-targets -- -D warnings
 ```
 
-Actual results: **76 default tests** (19 lifecycle), **81 transpiled-base tests** passed; three pre-existing doctests remain ignored in each mode. Both
-Clippy modes and the targeted rustfmt check passed. Tests prove peer EOF after scoped
+Actual results: **80 default tests** (23 lifecycle), **85 transpiled-base tests** passed; three pre-existing doctests remain ignored in each mode. Both
+Clippy modes and the targeted rustfmt check passed. Typed-cause regressions cover
+transport → Internal and Internal → transport first-message ordering on real connected
+clients, racing transport/decoder failure, and transport plus two independently awaited
+panics (no deduplication of actual JoinErrors). Tests prove peer EOF after scoped
 join, zero-started-task pending-handshake cancellation, join cancellation/retry,
 concurrent joins, explicit timeout and panic outcomes, owner conflict isolation,
 old-generation removal fencing, raw key churn and observer continuity, separate
