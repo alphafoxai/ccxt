@@ -17,8 +17,14 @@ resolve, reset, open a flight or mutate subscriptions on a replacement generatio
 
 Stop and join caller-owned watch/driver tasks, then await
 `scope.close_and_join(Duration)`. `ScopeJoinReport` reports client and awaited-task
-counts, timeout and failures. `all_joined()` requires no timeout and no internal
-failure. Aborted **and awaited** reader/writer/keepalive tasks count as joined: this
+counts, timeout and failures, plus a `cleanup_complete` bool proving the scope
+is closed and this call awaited every owned handle: success, panic and
+cancelled outcomes all count as destruction evidence once awaited, while
+timeout, a cancelled join future, retained handles or a lock-wait timeout
+force false. An empty scope is vacuously complete but covers only fork-held
+internal tasks. `all_joined()` requires no timeout and no internal
+failure and is unchanged: terminal transport errors keep `cleanup_complete`
+true while `all_joined()` stays false. Aborted **and awaited** reader/writer/keepalive tasks count as joined: this
 proves task destruction, not a graceful WebSocket close handshake.
 
 `request_close`, `drop_client`, and scope Drop only request cancellation. They must
@@ -88,8 +94,7 @@ cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --all-
 cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --features transpiled-base --all-targets -- -D warnings
 ```
 
-Actual results: **75 default tests**, **80 transpiled-base tests** passed (37 are
-transport tests); three pre-existing doctests remain ignored in each mode. Both
+Actual results: **76 default tests** (19 lifecycle), **81 transpiled-base tests** passed; three pre-existing doctests remain ignored in each mode. Both
 Clippy modes and the targeted rustfmt check passed. Tests prove peer EOF after scoped
 join, zero-started-task pending-handshake cancellation, join cancellation/retry,
 concurrent joins, explicit timeout and panic outcomes, owner conflict isolation,

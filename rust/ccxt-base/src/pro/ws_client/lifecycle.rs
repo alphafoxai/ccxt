@@ -69,6 +69,7 @@ impl ClientScope {
         let deadline = tokio::time::Instant::now() + bound;
         let mut report = ScopeJoinReport {
             clients: clients.len(),
+            cleanup_complete: true,
             ..Default::default()
         };
         for client in clients {
@@ -77,10 +78,20 @@ impl ClientScope {
                 .is_err()
             {
                 report.timed_out = true;
+                // This caller did not observe this client's tasks (it may be
+                // parked behind another joiner's gate lock). Even if another
+                // joiner emptied the handles meanwhile, this report cannot
+                // claim cleanup proof.
+                report.cleanup_complete = false;
             }
             let tasks = client.tasks.lock().unwrap();
             report.tasks_joined += tasks.joined;
             report.failures.extend(tasks.failures.iter().cloned());
+            if !tasks.handles.is_empty() {
+                // Handles still in flight (cancelled/timed-out join, or a
+                // caller-owned connect future that has not been awaited).
+                report.cleanup_complete = false;
+            }
             drop(tasks);
             if let Some(error) = client.terminal_error() {
                 report.failures.push(error);
@@ -90,6 +101,11 @@ impl ClientScope {
             }
         }
         reclaim_raw_buses();
+        // Authoritative closure check: the scope must have refused further
+        // acquisition (request_close ran at entry) and this call must have
+        // observed every owned handle with no timeout.
+        let closed = self.inner.state.lock().unwrap().closed;
+        report.cleanup_complete = report.cleanup_complete && closed && !report.timed_out;
         report
     }
 }
@@ -105,12 +121,22 @@ impl Drop for ClientScope {
 
 /// Evidence from a scoped internal shutdown. Aborted-and-awaited tasks count as
 /// joined; this is task destruction evidence, not a graceful wire close handshake.
+///
+/// `cleanup_complete` proves the scope is closed and this call awaited every
+/// owned internal handle (success, panic and cancelled outcomes all count as
+/// destruction evidence once awaited). It is independent of `all_joined()`:
+/// terminal transport errors and panics keep `cleanup_complete == true` while
+/// `all_joined()` stays false. Timeout, a cancelled join future, retained
+/// handles or a lock-wait timeout all force `cleanup_complete == false`.
+/// An empty scope is vacuously complete, but that only covers fork-held
+/// internal tasks; caller-owned connect/watch futures need separate proof.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScopeJoinReport {
     pub clients: usize,
     pub tasks_joined: usize,
     pub timed_out: bool,
     pub failures: Vec<String>,
+    pub cleanup_complete: bool,
 }
 impl ScopeJoinReport {
     /// True only after all handles were observed and no internal failure occurred.
@@ -265,6 +291,7 @@ impl ClientState {
             tasks_joined: tasks.joined,
             timed_out,
             failures: tasks.failures.clone(),
+            cleanup_complete: !timed_out && tasks.handles.is_empty(),
         };
         drop(tasks);
         if let Some(error) = self.terminal_error() {

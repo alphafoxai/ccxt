@@ -23,6 +23,7 @@ async fn scoped_join_observes_three_tasks_and_peer_eof() {
     assert_eq!(client.tasks.lock().unwrap().handles.len(), 3);
     let report = scope.close_and_join(BOUND).await;
     assert!(report.all_joined(), "{report:?}");
+    assert!(report.cleanup_complete, "{report:?}");
     assert_eq!(report.clients, 1);
     assert_eq!(report.tasks_joined, 3);
     assert!(client.tasks.lock().unwrap().handles.is_empty());
@@ -48,6 +49,28 @@ async fn cancelled_join_retains_handles_and_retry_observes_them() {
     drop(gate);
     let report = scope.close_and_join(BOUND).await;
     assert!(report.all_joined(), "{report:?}");
+    assert!(report.cleanup_complete, "{report:?}");
+    assert_eq!(report.tasks_joined, 3);
+    tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_outer_timeout_produces_no_report_and_retry_completes() {
+    let (url, peer) = server().await;
+    let scope = ClientScope::new();
+    let client = scope.run(ensure_client(&url, None)).await.unwrap();
+    // The outer timeout cancels the join future: no report value exists at
+    // all, and the owned handles must be retained rather than fabricated.
+    let gate = client.join_gate.lock().await;
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(50), scope.close_and_join(BOUND)).await;
+    assert!(cancelled.is_err(), "join must not settle while gated");
+    drop(cancelled);
+    assert_eq!(client.tasks.lock().unwrap().handles.len(), 3);
+    drop(gate);
+    let report = scope.close_and_join(BOUND).await;
+    assert!(report.all_joined(), "{report:?}");
+    assert!(report.cleanup_complete, "{report:?}");
     assert_eq!(report.tasks_joined, 3);
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
 }
@@ -59,6 +82,7 @@ async fn concurrent_join_is_idempotent() {
     scope.run(ensure_client(&url, None)).await.unwrap();
     let (a, b) = tokio::join!(scope.close_and_join(BOUND), scope.close_and_join(BOUND));
     assert!(a.all_joined() && b.all_joined(), "{a:?} {b:?}");
+    assert!(a.cleanup_complete && b.cleanup_complete, "{a:?} {b:?}");
     assert_eq!(a.tasks_joined, 3);
     assert_eq!(b.tasks_joined, 3);
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
@@ -72,9 +96,11 @@ async fn timeout_is_not_success_and_retry_can_join() {
     let gate = client.join_gate.lock().await;
     let report = scope.close_and_join(Duration::from_millis(1)).await;
     assert!(report.timed_out && !report.all_joined());
+    assert!(!report.cleanup_complete, "{report:?}");
     drop(gate);
     let report = scope.close_and_join(BOUND).await;
     assert!(report.all_joined(), "{report:?}");
+    assert!(report.cleanup_complete, "{report:?}");
     assert_eq!(report.tasks_joined, 3);
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
 }
@@ -91,9 +117,13 @@ async fn foreign_scope_rejected_without_poison_or_cancellation() {
     assert!(conflict.is_err());
     assert!(!client.is_closed());
     assert_eq!(get_client(&url).unwrap().generation(), client.generation());
-    assert_eq!(second.close_and_join(BOUND).await.clients, 0);
+    let foreign_report = second.close_and_join(BOUND).await;
+    assert_eq!(foreign_report.clients, 0);
+    assert!(foreign_report.cleanup_complete, "{foreign_report:?}");
     assert!(client.send_text("still-owned".to_owned()));
-    assert!(first.close_and_join(BOUND).await.all_joined());
+    let report = first.close_and_join(BOUND).await;
+    assert!(report.all_joined(), "{report:?}");
+    assert!(report.cleanup_complete, "{report:?}");
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
 }
 
@@ -112,6 +142,7 @@ async fn scope_cancels_pending_handshake_before_first_frame() {
     assert!(tokio::time::timeout(BOUND, connect).await.unwrap().is_err());
     let report = scope.close_and_join(BOUND).await;
     assert!(report.all_joined(), "{report:?}");
+    assert!(report.cleanup_complete, "{report:?}");
     assert_eq!(report.clients, 1);
     assert_eq!(report.tasks_joined, 0);
     use tokio::io::AsyncReadExt;
@@ -131,7 +162,9 @@ async fn scope_drop_releases_socket_without_claiming_join() {
     assert!(client.is_closed());
     assert!(!REGISTRY.lock().unwrap().contains_key(&url));
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
-    assert_eq!(client.close_and_join(BOUND).await.tasks_joined, 3);
+    let dropped = client.close_and_join(BOUND).await;
+    assert_eq!(dropped.tasks_joined, 3);
+    assert!(dropped.cleanup_complete, "{dropped:?}");
 }
 
 #[tokio::test]
@@ -186,7 +219,9 @@ async fn outgoing_frame_count_and_bytes_are_independent_terminal_limits() {
         assert!(client.terminal_error().unwrap().contains(error));
         assert!(client.is_closed());
         assert_eq!(client.outgoing_budget.available_permits(), OUTGOING_BYTES);
-        assert!(!scope.close_and_join(BOUND).await.all_joined());
+        let terminal = scope.close_and_join(BOUND).await;
+        assert!(!terminal.all_joined());
+        assert!(terminal.cleanup_complete, "{terminal:?}");
     }
 }
 
@@ -205,7 +240,9 @@ async fn incoming_overflow_is_not_successful_empty() {
         .catch_unwind()
         .await
         .is_err());
-    assert!(!scope.close_and_join(BOUND).await.all_joined());
+    let overflow = scope.close_and_join(BOUND).await;
+    assert!(!overflow.all_joined());
+    assert!(overflow.cleanup_complete, "{overflow:?}");
 }
 
 #[tokio::test]
@@ -243,7 +280,9 @@ async fn raw_overflow_reports_lag_and_payload_cap_is_not_bypassed() {
     ));
     client.mock_inject_raw(vec![0; MAX_PAYLOAD_BYTES + 1], true);
     assert!(client.terminal_error().unwrap().contains("payload"));
-    assert!(!scope.close_and_join(BOUND).await.all_joined());
+    let payload = scope.close_and_join(BOUND).await;
+    assert!(!payload.all_joined());
+    assert!(payload.cleanup_complete, "{payload:?}");
 }
 
 #[tokio::test]
@@ -283,6 +322,7 @@ async fn socket_rejects_fragmented_aggregate_over_wire_limit() {
     let report = scope.close_and_join(BOUND).await;
     assert_eq!(report.tasks_joined, 3);
     assert!(!report.all_joined() && !report.timed_out);
+    assert!(report.cleanup_complete, "{report:?}");
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
 }
 
@@ -300,6 +340,7 @@ async fn internal_panic_is_joined_but_not_reported_as_success() {
     let report = scope.close_and_join(BOUND).await;
     assert_eq!(report.tasks_joined, 1);
     assert!(!report.all_joined() && !report.timed_out);
+    assert!(report.cleanup_complete, "{report:?}");
     assert!(report.failures[0].contains("panic"));
 }
 
@@ -322,7 +363,9 @@ async fn spare_payload_capacity_cannot_bypass_retained_byte_limits() {
     let frame = raw.recv().await.unwrap();
     assert_eq!(frame.payload.capacity(), frame.payload.len());
     assert_eq!(frame.payload, b"pong");
-    assert!(!scope.close_and_join(BOUND).await.all_joined());
+    let spare = scope.close_and_join(BOUND).await;
+    assert!(!spare.all_joined());
+    assert!(spare.cleanup_complete, "{spare:?}");
 }
 
 #[tokio::test]
