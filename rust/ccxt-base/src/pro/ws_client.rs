@@ -321,7 +321,10 @@ impl ClientState {
         }
         let result = self.incoming.lock().unwrap().push(value);
         if let Err(error) = result {
-            self.fail(error);
+            // Queue exhaustion is a terminal transport/backpressure condition, not an
+            // unknown internal invariant. The owner may replace the socket after the
+            // scope proves cleanup; decoder failures remain `Internal` in receive_payload.
+            self.fail_with_source(ScopeFailureSource::TransportTerminal, error);
         }
         self.notify.notify_waiters();
     }
