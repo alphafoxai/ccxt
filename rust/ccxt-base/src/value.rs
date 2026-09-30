@@ -278,17 +278,7 @@ impl Value {
     /// receiver (or a non-string hash) degrades to the old pass-the-hash-back
     /// behaviour so unrelated transpiled code keeps compiling.
     fn open_flight(&self, msg_hash: Value) -> Value {
-        let hash = match &msg_hash {
-            Value::Str(h) => h.clone(),
-            _ => return msg_hash,
-        };
-        match crate::pro::ws_client::url_of(self) {
-            Some(url) => {
-                let led = crate::pro::ws_client::begin_flight(&url, &hash);
-                crate::pro::ws_client::flight_handle(&url, &hash, led)
-            }
-            None => msg_hash,
-        }
+        crate::pro::ws_client::value_open_flight(self, msg_hash)
     }
     /// Field accessor: `cache.hashmap` — same as the WS Cache marker's
     /// hashmap sub-dict. Some transpiled WS code reads this directly
@@ -717,8 +707,8 @@ pub fn get_value(obj: &Value, key: &Value) -> Value {
             if (k == "subscriptions" || k == "futures")
                 && m.contains_key("subscriptions") && m.contains_key("futures")
             {
-                if let Some(Value::Str(url)) = m.get("url") {
-                    return crate::pro::ws_client::client_field_live(url, k);
+                if let Some(Value::Str(reference)) = m.get("__ws_reference") {
+                    return crate::pro::ws_client::client_field_live(reference, k);
                 }
             }
             // Snapshot value wins WHEN PRESENT AND NON-NULL. Tests that
