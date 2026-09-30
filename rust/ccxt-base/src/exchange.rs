@@ -1193,12 +1193,35 @@ pub trait ExchangeRuntime: crate::exchange_generated::ExchangeBase {
                 send_subscribe = true;
             }
         }
+        let raw_owner_drain = crate::runtime::is_true(&crate::runtime::get_value(
+            &message,
+            &Value::Str("rawOwnerDrain".to_string()),
+        ));
         if send_subscribe && !matches!(message, Value::Null) {
-            let payload = match &message {
+            let wire_message = self.omit(
+                message.clone(),
+                Value::Str("rawOwnerDrain".to_string()),
+                &[],
+            );
+            let payload = match &wire_message {
                 Value::Str(s) => s.clone(),
                 v => v.to_json().to_string(),
             };
             client.send_text(payload);
+        }
+        // Market Node's last-price owner already receives the raw reader handoff and
+        // does not need CCXT's venue-specific dispatch/settling path after the first
+        // trade has admitted the watch. Keep draining the parsed queue directly so a
+        // busy venue cannot fill the 256-frame/4 MiB queue while the raw observer does
+        // the authoritative decode. The marker is an internal Rust-owner parameter and
+        // is never sent on the wire (it is merged into the subscribe request only).
+        if raw_owner_drain {
+            loop {
+                match client.next_message().await {
+                    Some(_) => {}
+                    None => panic!("[NetworkError] {} websocket connection closed", url),
+                }
+            }
         }
         // Mirror the connection into `self.clients`, the map TS venues iterate
         // to decide whether a stream is still worth keeping alive (binance's
