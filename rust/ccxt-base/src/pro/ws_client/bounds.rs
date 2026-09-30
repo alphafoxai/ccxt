@@ -15,7 +15,11 @@ pub(super) const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 /// Maximum number of bytes a compressed frame may expand to.
 pub(super) const MAX_DECODED_BYTES: usize = 1024 * 1024;
 /// Maximum number of parsed frames retained by the inbound queue.
-pub(super) const INCOMING_CAPACITY: usize = 256;
+///
+/// A 256-frame queue is too small for a bounded burst from a multi-market
+/// public owner; 1024 absorbs that burst while `INCOMING_BYTES` remains the
+/// independent memory ceiling and still turns sustained overload terminal.
+pub(super) const INCOMING_CAPACITY: usize = 1024;
 /// Maximum estimated retained bytes in the inbound queue.
 pub(super) const INCOMING_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum number of frames waiting for the writer.
