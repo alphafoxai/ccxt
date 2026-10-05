@@ -122,7 +122,7 @@ const MAX_RAW_URLS: usize = 256;
 /// a consumer that genuinely cannot keep up. The budget is small against the
 /// 1024-frame parsed queue and 64-frame per-URL raw bus. A quiet stream pays
 /// at most one extra scheduler yield per 32 frames, not per frame.
-const READER_YIELD_FRAMES: usize = RAW_BUS_CAPACITY / 2;
+const READER_YIELD_FRAMES: usize = 32;
 
 struct Outgoing {
     message: Message,

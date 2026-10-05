@@ -60,7 +60,11 @@ tokio::task_local! {
 /// The caller owns raw-frame admission, lag detection and socket cleanup. This
 /// opt-in is task-local, does not cross spawned tasks, sends no wire parameter,
 /// and is removed when this future finishes, panics or is cancelled. Ordinary
-/// watches are unchanged. Intended only for scoped raw-owner adapters.
+/// watches are unchanged. Intended only for scoped raw-owner adapters of public
+/// feeds: no authentication, delayed venue coroutines, or nested watches. The
+/// caller must keep one parsed-queue drain per URL; this does not add consumers
+/// or replace ClientScope ownership. A watch requiring parsed callbacks must
+/// not opt in.
 pub async fn with_raw_owner_drain<F: std::future::Future>(future: F) -> F::Output {
     RAW_OWNER_DRAIN.scope((), future).await
 }
