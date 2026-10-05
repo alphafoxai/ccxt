@@ -110,6 +110,20 @@ struct FlightSlot {
 const RAW_BUS_CAPACITY: usize = 64;
 const MAX_RAW_URLS: usize = 256;
 
+/// Frames the reader task processes between two explicit scheduler yields.
+///
+/// A buffered burst is served from tungstenite's internal read buffer, so
+/// `read.next()` returns Ready without a socket read and the reader loop has
+/// no yield point of its own; the watch drive loop then goes unscheduled on a
+/// single-threaded runtime and the bounded parsed queue fills from frames no
+/// consumer has seen. Yielding on a frame budget keeps a ready consumer
+/// scheduled without changing any bound: the queue still caps at
+/// `INCOMING_CAPACITY` / `INCOMING_BYTES` and exhaustion is still terminal for
+/// a consumer that genuinely cannot keep up. The budget is small against the
+/// 1024-frame parsed queue and 64-frame per-URL raw bus. A quiet stream pays
+/// at most one extra scheduler yield per 32 frames, not per frame.
+const READER_YIELD_FRAMES: usize = RAW_BUS_CAPACITY / 2;
+
 struct Outgoing {
     message: Message,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -976,6 +990,7 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
     let reader_state = state.clone();
     tasks.handles.push(tokio::spawn(async move {
         let _exit = TaskExit(reader_state.clone());
+        let mut since_yield = 0;
         while let Some(frame) = read.next().await {
             match frame {
                 Ok(Message::Text(text)) => reader_state.receive_payload(text.into_bytes(), false),
@@ -999,6 +1014,14 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
             }
             if reader_state.is_closed() {
                 return;
+            }
+            // Buffered frames can keep read.next() Ready without touching the
+            // socket. Give parsed/raw consumers a scheduling opportunity at a
+            // fixed frame budget; genuine lag retains the original bounds.
+            since_yield += 1;
+            if since_yield >= READER_YIELD_FRAMES {
+                since_yield = 0;
+                tokio::task::yield_now().await;
             }
         }
         reader_state.fail_with_source(
@@ -1402,6 +1425,7 @@ pub fn value_on_pong(client: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     // A minimal mock exchange WS server: accepts one connection, waits for a
@@ -1533,6 +1557,229 @@ mod tests {
         // First streamed ticker.
         assert_eq!(result, Value::Str("100.5".to_string()));
         drop_client(&url);
+    }
+
+    // ── reader scheduling fairness (buffered burst vs. the bounded queue) ────
+    //
+    // The reader task pulls frames in one `while let Some(frame) =
+    // read.next().await` loop. When the socket already holds a burst, each
+    // `poll_next` returns Ready straight out of tungstenite's internal buffer
+    // without touching the socket, so the loop runs on with no yield point in
+    // it. On a single-threaded runtime the watch drive loop (`next_message`)
+    // is then never scheduled, and the bounded parsed queue fills to
+    // `INCOMING_CAPACITY` from frames no consumer ever looked at.
+
+    /// Frames a burst peer streams back-to-back. Far above the bounded parsed
+    /// queue (`INCOMING_CAPACITY` = 1024) so that scheduling, not the bound,
+    /// decides whether the burst survives.
+    const FAIRNESS_BURST_FRAMES: usize = 8 * 1024;
+
+    /// One compact server→client text frame (unmasked, single-byte length).
+    fn burst_frame(sequence: usize) -> Vec<u8> {
+        let payload = format!("{{\"seq\":{sequence},\"px\":\"100.5\"}}");
+        assert!(payload.len() < 126, "burst frames stay single-byte length");
+        let mut frame = vec![0x81u8, payload.len() as u8];
+        frame.extend_from_slice(payload.as_bytes());
+        frame
+    }
+
+    /// Localhost WebSocket peer that streams `frames` compact JSON frames as
+    /// fast as the socket accepts them, then parks until the client disconnects.
+    ///
+    /// The peer lives on its own OS thread on purpose. A tokio writer task
+    /// could only refill the socket *between* reader yields, which would make
+    /// "the socket stays readable" depend on scheduler ordering instead of on
+    /// the reader's own loop. A blocking thread keeps the receive buffer topped
+    /// up the way a live venue does, and parking on a blocking read afterwards
+    /// keeps the connection open so a consumer cannot observe a close before
+    /// the burst has been accounted for.
+    fn spawn_burst_server(frames: usize) -> (String, std::thread::JoinHandle<()>) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use sha1::Sha1;
+        use sha2::Digest;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_nodelay(true).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            // Minimal RFC 6455 opening handshake: reply 101 + Sec-WebSocket-Accept.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "client closed during the handshake");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request).to_string();
+            let mut key = None;
+            for line in request.lines() {
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("Sec-WebSocket-Key") {
+                        key = Some(value.trim().to_string());
+                    }
+                }
+            }
+            let mut digest = Sha1::new();
+            digest.update(key.expect("Sec-WebSocket-Key header").as_bytes());
+            digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            let accept = B64.encode(digest.finalize());
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            // The burst: never waits on the reader, so the socket reads Ready
+            // for as long as the peer has frames left. A client that terminates
+            // mid-burst (the starvation case under test) can break this write,
+            // which the drain assertions below account for.
+            let burst: Vec<u8> = (0..frames).flat_map(burst_frame).collect();
+            let _ = socket.write_all(&burst);
+            let _ = socket.flush();
+            // Park until the client goes away; a ping or close frame is drained.
+            let mut sink = [0u8; 256];
+            while socket.read(&mut sink).unwrap_or(0) > 0 {}
+        });
+        (url, peer)
+    }
+
+    struct BurstOutcome {
+        delivered: usize,
+        last_sequence: usize,
+        terminal: Option<String>,
+        elapsed: std::time::Duration,
+    }
+
+    /// Drain the parsed queue exactly the way the watch drive loop does: take
+    /// the next message, account for it, ask for the next. No per-frame await,
+    /// no deadline, no `handle_message` work — the cheapest consumer this
+    /// runtime can express, i.e. one that keeps up whenever it is scheduled.
+    /// A terminal queue overflow surfaces as `terminal`, not as a test panic.
+    async fn drain_burst(client: Arc<ClientState>, frames: usize) -> BurstOutcome {
+        let started = std::time::Instant::now();
+        let mut delivered = 0;
+        let mut last_sequence = 0;
+        loop {
+            let next = std::panic::AssertUnwindSafe(client.next_message())
+                .catch_unwind()
+                .await;
+            let message = match next {
+                Ok(Some(message)) => message,
+                Ok(None) | Err(_) => break,
+            };
+            match crate::get_value(&message, &Value::Str("seq".to_string())) {
+                Value::Int(sequence) => {
+                    assert_eq!(sequence as usize, delivered, "parsed frame order");
+                    last_sequence = sequence as usize;
+                }
+                other => panic!("burst frame without a sequence: {other:?}"),
+            }
+            delivered += 1;
+            if delivered == frames {
+                break;
+            }
+        }
+        BurstOutcome {
+            delivered,
+            last_sequence,
+            terminal: client.terminal_error(),
+            elapsed: started.elapsed(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_burst_does_not_starve_a_ready_consumer() {
+        let (url, peer) = spawn_burst_server(FAIRNESS_BURST_FRAMES);
+        let scope = ClientScope::new();
+        let mut raw = subscribe_raw(&url);
+        let client = scope.run(ensure_client(&url, None)).await.unwrap();
+        // Exact order and no lag for both ready consumers. Wall time is only
+        // a hang guard, not a claimed throughput/capacity threshold.
+        let outcomes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                tokio::join!(drain_burst(client.clone(), FAIRNESS_BURST_FRAMES), async {
+                    for expected in 0..FAIRNESS_BURST_FRAMES {
+                        let frame = raw.recv().await.expect("ready raw consumer lagged");
+                        let row: serde_json::Value =
+                            serde_json::from_slice(&frame.payload).unwrap();
+                        assert_eq!(row["seq"].as_u64(), Some(expected as u64));
+                    }
+                })
+            },
+        )
+        .await;
+        let report = scope
+            .close_and_join(std::time::Duration::from_secs(10))
+            .await;
+        assert!(report.cleanup_complete, "{report:?}");
+        peer.join().unwrap();
+        let (outcome, ()) = outcomes.expect("the consumers stalled instead of draining the burst");
+        assert_eq!(
+            outcome.terminal,
+            None,
+            "reader starved a ready consumer: {} of {} frames in {:?} (last seq {}), terminal {:?}",
+            outcome.delivered,
+            FAIRNESS_BURST_FRAMES,
+            outcome.elapsed,
+            outcome.last_sequence,
+            outcome.terminal,
+        );
+        assert_eq!(
+            outcome.delivered, FAIRNESS_BURST_FRAMES,
+            "a fairly scheduled burst loses no frames"
+        );
+        assert_eq!(
+            outcome.last_sequence,
+            FAIRNESS_BURST_FRAMES - 1,
+            "the burst arrives complete and in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_burst_without_a_consumer_stays_terminal() {
+        // The same burst with nothing draining the queue: genuine sustained
+        // lag, which the yield budget must not soften. No consumer is polled at
+        // all here, so the result cannot depend on scheduler ordering — the
+        // socket is still readable and the queue is still bounded.
+        let (url, peer) = spawn_burst_server(FAIRNESS_BURST_FRAMES);
+        let scope = ClientScope::new();
+        let client = scope.run(ensure_client(&url, None)).await.unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(error) = client.terminal_error() {
+                    break error;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an undrained burst never reached the bounded queue limit");
+        assert!(
+            terminal.contains("incoming WebSocket queue capacity exceeded"),
+            "{terminal}"
+        );
+        assert!(client.is_closed());
+        // Not a successful empty result for a caller that shows up late.
+        let late = std::panic::AssertUnwindSafe(client.next_message())
+            .catch_unwind()
+            .await;
+        assert!(
+            late.is_err(),
+            "late consumer must observe the terminal cause"
+        );
+        let report = scope
+            .close_and_join(std::time::Duration::from_secs(10))
+            .await;
+        assert!(report.cleanup_complete, "{report:?}");
+        assert!(!report.all_joined(), "{report:?}");
+        peer.join().unwrap();
     }
 
     // ── single-flight (client.future / client.reusableFuture) ───────────────
