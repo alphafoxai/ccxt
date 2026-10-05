@@ -61,8 +61,11 @@ a venue does not forward params. Ordinary watch behavior is unchanged.
 
 This narrow seam is for callers already validating reader-boundary raw frames and
 handling raw lag/transport terminal failures. Use `ClientScope` separately for
-transport ownership/cleanup. Exactly one drain per URL is required. Authentication,
-venue delayed coroutines, nested watches and parsed callback-dependent feeds are
+transport ownership/cleanup. A URL must be exclusively raw-owned: several
+subscription futures may discard parsed rows on the same URL (e.g. Hyperliquid
+per-coin subscriptions), because the authoritative raw broadcast is independent.
+Never mix an ordinary parsed consumer on that URL. Authentication, venue delayed
+coroutines, nested watches and parsed callback-dependent feeds are
 not supported in raw mode; those paths must retain normal dispatch. It does not
 provide another socket owner or change semantic validation.
 

@@ -62,9 +62,11 @@ tokio::task_local! {
 /// and is removed when this future finishes, panics or is cancelled. Ordinary
 /// watches are unchanged. Intended only for scoped raw-owner adapters of public
 /// feeds: no authentication, delayed venue coroutines, or nested watches. The
-/// caller must keep one parsed-queue drain per URL; this does not add consumers
-/// or replace ClientScope ownership. A watch requiring parsed callbacks must
-/// not opt in.
+/// caller must keep a URL exclusively raw-owned. Multiple subscription futures
+/// may discard parsed rows from that URL because raw frames are broadcast
+/// independently; never mix a parsed consumer on the same URL. This does not
+/// replace ClientScope ownership. A watch requiring parsed callbacks must not
+/// opt in.
 pub async fn with_raw_owner_drain<F: std::future::Future>(future: F) -> F::Output {
     RAW_OWNER_DRAIN.scope((), future).await
 }
