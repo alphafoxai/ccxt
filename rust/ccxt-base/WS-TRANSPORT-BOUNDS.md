@@ -28,9 +28,11 @@ true while `all_joined()` stays false. Aborted **and awaited** reader/writer/kee
 proves task destruction, not a graceful WebSocket close handshake.
 
 Failures are typed `ScopeFailure { source, message }`, preserving the original text.
-`TransportTerminal` is assigned only at EOF or for tungstenite I/O, closed/already-closed,
-and reset-without-closing-handshake variants. Budget, decoder, UTF-8, capacity, other
-protocol and unknown errors are `Internal`; awaited task panics are `TaskPanic`.
+`TransportTerminal` is assigned at EOF, for tungstenite I/O, closed/already-closed,
+and reset-without-closing-handshake variants, and for parsed incoming count/byte
+exhaustion (the merged price-queue classification change). Decoder, UTF-8, payload,
+outgoing budget, other protocol and unknown errors remain `Internal`; awaited task
+panics are `TaskPanic`.
 No classification parses error text. The first terminal message remains available via
 `terminal_error()`. A racing later Internal cannot be hidden by that first message:
 one suppressed Internal per client is retained in `Tasks.failures`; actual non-cancelled
@@ -48,6 +50,29 @@ Connect and proxy handshake have a 30-second ceiling, are cancellable by scope c
 and use the same tungstenite limits. The scope join report concerns internal spawned
 tasks, **not** caller-owned connect/watch futures: join those outer futures first.
 
+## Explicit public raw-owner drain
+
+`exchange::with_raw_owner_drain(watch_future)` opts a complete public watch future
+into continuously consuming the parsed queue without venue dispatch/settling. It is
+task-local, survives migration, does not cross `tokio::spawn`, and is removed on
+cancellation/panic/return. The legacy internal `rawOwnerDrain` marker is still
+supported and stripped before wire serialization; the scoped form works even when
+a venue does not forward params. Ordinary watch behavior is unchanged.
+
+This narrow seam is for callers already validating reader-boundary raw frames and
+handling raw lag/transport terminal failures. Use `ClientScope` separately for
+transport ownership/cleanup. A URL must be exclusively raw-owned: several
+subscription futures may discard parsed rows on the same URL (e.g. Hyperliquid
+per-coin subscriptions), because the authoritative raw broadcast is independent.
+Never mix an ordinary parsed consumer on that URL. Authentication, venue delayed
+coroutines, nested watches and parsed callback-dependent feeds are
+not supported in raw mode; those paths must retain normal dispatch. It does not
+provide another socket owner or change semantic validation.
+
+The reader yields every 32 frames to give ready parsed/raw consumers an opportunity
+to run during a buffered burst. This is scheduling fairness, not an increased queue
+bound or a promise that a loaded host can keep up. Genuine lag remains observable.
+
 ## Fixed limits
 
 | Boundary | Limit |
@@ -55,7 +80,7 @@ tasks, **not** caller-owned connect/watch futures: join those outer futures firs
 | Wire message, including fragmented aggregate | 256 KiB |
 | Individual wire frame | 256 KiB |
 | Expanded gzip/raw-deflate payload | 1 MiB |
-| Parsed inbound queue | 256 entries and 4 MiB accounting budget |
+| Parsed inbound queue | 1024 entries and 4 MiB accounting budget |
 | Outgoing queue | 64 entries and 1 MiB retained payload-capacity permits, including the in-flight write |
 | Tungstenite write buffer | 1 MiB |
 | Raw URL bus | 64 entries × 256 KiB = 16 MiB retained payload |

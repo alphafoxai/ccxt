@@ -52,7 +52,28 @@ tokio::task_local! {
     // resolving. Instead it just sends its subscribe frame and returns; the
     // outer loop processes the reply. Task-local so it survives task migration.
     static WS_DRIVEN_URLS: std::sync::Mutex<std::collections::HashSet<String>>;
+    static RAW_OWNER_DRAIN: ();
 }
+
+/// Drive an explicitly raw-observed watch without venue-specific parsed dispatch.
+///
+/// The caller owns raw-frame admission, lag detection and socket cleanup. This
+/// opt-in is task-local, does not cross spawned tasks, sends no wire parameter,
+/// and is removed when this future finishes, panics or is cancelled. Ordinary
+/// watches are unchanged. Intended only for scoped raw-owner adapters of public
+/// feeds: no authentication, delayed venue coroutines, or nested watches. The
+/// caller must keep a URL exclusively raw-owned. Multiple subscription futures
+/// may discard parsed rows from that URL because raw frames are broadcast
+/// independently; never mix a parsed consumer on the same URL. This does not
+/// replace ClientScope ownership. A watch requiring parsed callbacks must not
+/// opt in.
+pub async fn with_raw_owner_drain<F: std::future::Future>(future: F) -> F::Output {
+    RAW_OWNER_DRAIN.scope((), future).await
+}
+
+#[cfg(test)]
+#[path = "exchange/raw_owner_tests.rs"]
+mod raw_owner_tests;
 
 /// Snapshot + reset the global HTTP/JSON timings. Returns
 /// `(http_nanos, json_nanos, http_calls)` and zeroes them.
@@ -1193,10 +1214,11 @@ pub trait ExchangeRuntime: crate::exchange_generated::ExchangeBase {
                 send_subscribe = true;
             }
         }
-        let raw_owner_drain = crate::runtime::is_true(&crate::runtime::get_value(
-            &message,
-            &Value::Str("rawOwnerDrain".to_string()),
-        ));
+        let raw_owner_drain = RAW_OWNER_DRAIN.try_with(|_| ()).is_ok()
+            || crate::runtime::is_true(&crate::runtime::get_value(
+                &message,
+                &Value::Str("rawOwnerDrain".to_string()),
+            ));
         if send_subscribe && !matches!(message, Value::Null) {
             let wire_message = self.omit(
                 message.clone(),
@@ -1210,11 +1232,11 @@ pub trait ExchangeRuntime: crate::exchange_generated::ExchangeBase {
             client.send_text(payload);
         }
         // Market Node's last-price owner already receives the raw reader handoff and
-        // does not need CCXT's venue-specific dispatch/settling path after the first
-        // trade has admitted the watch. Keep draining the parsed queue directly so a
-        // busy venue cannot fill the 256-frame/4 MiB queue while the raw observer does
-        // the authoritative decode. The marker is an internal Rust-owner parameter and
-        // is never sent on the wire (it is merged into the subscribe request only).
+        // does not need CCXT's venue-specific dispatch/settling path. Keep draining
+        // the bounded parsed queue while the raw observer does authoritative decode.
+        // Prefer explicit task-local opt-in: not every venue forwards params to the
+        // subscribe request. The legacy marker remains supported and is stripped
+        // above; neither mechanism sends an extra field on the wire.
         if raw_owner_drain {
             loop {
                 match client.next_message().await {
