@@ -27,7 +27,7 @@ pub use lifecycle::{ClientScope, ScopeFailure, ScopeFailureSource, ScopeJoinRepo
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Instant;
@@ -85,6 +85,17 @@ pub struct ClientState {
     connected: Mutex<bool>,
     closed: Mutex<bool>,
     last_pong_ms: Mutex<i64>,
+    /// Merged venue cadence, fixed while this generation has live raw drivers.
+    heartbeat_interval: Mutex<std::time::Duration>,
+    /// Monotonic instant of the last heartbeat frame claimed for bounded enqueue for
+    /// this socket. The claim is what makes one URL send one frame per window no
+    /// matter how many raw watchers share it (TS has a single `setInterval` per
+    /// client; here N drive loops race for one socket).
+    last_heartbeat: Mutex<Option<tokio::time::Instant>>,
+    /// Live raw-owner heartbeat drivers on this socket generation. While this is
+    /// non-zero the generic control-ping task stands down, so a raw-owned socket is
+    /// never pinged twice per window by two independent owners.
+    raw_heartbeats: AtomicUsize,
     /// Static-WS-test mock transport. When `mock` is set, `send_text` records the
     /// (JSON-parsed) outgoing frame into `mock_sent` instead of relying on a
     /// socket, and no real connection is ever opened. `ws_test_completed` is the
@@ -123,6 +134,128 @@ const MAX_RAW_URLS: usize = 256;
 /// 1024-frame parsed queue and 64-frame per-URL raw bus. A quiet stream pays
 /// at most one extra scheduler yield per 32 frames, not per frame.
 const READER_YIELD_FRAMES: usize = 32;
+
+/// TS Client.keepAlive default; raw owners prefer merged streaming.keepAlive.
+pub(crate) const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+
+impl ClientState {
+    /// One step of the generic keep-alive. Returns false when the task should stop.
+    ///
+    /// A raw-owner drive loop owns the socket's heartbeat window while it is alive:
+    /// it emits the venue's own `ping` payload and holds the per-window claim.
+    /// Pinging here as well would put two frames on one socket per window and, for
+    /// the venues that only accept an application-level ping, would answer with the
+    /// wrong frame entirely. Split out from the timer so the ownership rule is
+    /// testable without a 30s clock.
+    pub(crate) fn generic_keepalive_step(&self) -> bool {
+        if !self.control_ping_owned() {
+            return true;
+        }
+        self.send_message(Message::Ping(Vec::new()))
+    }
+
+    /// Claim the heartbeat window for this socket. Monotonic (never wall clock, so a
+    /// paused-clock test and a clock adjustment both behave), and only the claimer
+    /// emits a frame: N raw watchers on one URL produce one frame per window, not N.
+    pub fn claim_heartbeat(&self, now: tokio::time::Instant) -> bool {
+        let mut last = self.last_heartbeat.lock().unwrap();
+        if let Some(previous) = *last {
+            if now.saturating_duration_since(previous) < *self.heartbeat_interval.lock().unwrap() {
+                return false;
+            }
+        }
+        *last = Some(now);
+        true
+    }
+
+    /// Cadence fixed by the first raw driver; peers must agree on a shared URL.
+    pub fn heartbeat_interval(&self) -> std::time::Duration {
+        *self.heartbeat_interval.lock().unwrap()
+    }
+
+    /// Whether the generic control-ping task still owns this socket. A raw-owner
+    /// driver claims it and stands the generic task down, so one socket is never
+    /// pinged by two owners in the same window.
+    pub fn control_ping_owned(&self) -> bool {
+        self.raw_heartbeats.load(Ordering::Acquire) == 0
+    }
+
+    /// Raw-owner drive loops currently sharing this socket's heartbeat window.
+    pub fn raw_heartbeat_drivers(&self) -> usize {
+        self.raw_heartbeats.load(Ordering::Acquire)
+    }
+
+    /// Send one heartbeat for this socket, exactly as TS `onPingInterval` does with the
+    /// value its derived `ping` returned: a payload wins, and only a falsy payload
+    /// falls back to an RFC-6455 control ping (binance/gate define no `ping`, so they
+    /// get the control frame). The frame goes through the same bounded outgoing path
+    /// as any other write, so the heartbeat inherits — and cannot bypass — the payload,
+    /// byte-budget and queue bounds.
+    ///
+    /// Returns false only after the socket has already been failed by the bounds; the
+    /// caller keeps looping so the terminal cause surfaces on the next read, exactly
+    /// as a failed venue write would.
+    pub fn send_heartbeat(&self, payload: Value) -> bool {
+        match &payload {
+            // Falsy in JS terms (`undefined`, `null`, `''`, `false`, `0`).
+            Value::Null | Value::Bool(false) | Value::Int(0) => {
+                return self.send_message(Message::Ping(Vec::new()))
+            }
+            Value::Float(number) if *number == 0.0 || number.is_nan() => {
+                return self.send_message(Message::Ping(Vec::new()))
+            }
+            Value::Str(text) if text.is_empty() => {
+                return self.send_message(Message::Ping(Vec::new()))
+            }
+            Value::Str(text) => self.send_text(text.clone()),
+            other => self.send_text(other.to_json().to_string()),
+        }
+    }
+
+    /// Take this socket's heartbeat window for a raw-owner drive loop. While the
+    /// returned guard is alive the generic control-ping task stands down; it is
+    /// released on drop, so a cancelled, panicked or returned raw watch cannot leave
+    /// the socket with no heartbeat at all.
+    pub(crate) fn drive_heartbeat_with_interval(
+        self: &Arc<Self>,
+        requested: Option<std::time::Duration>,
+    ) -> RawHeartbeatDriver {
+        let mut interval = self.heartbeat_interval.lock().unwrap();
+        if let Some(requested) = requested {
+            if self.raw_heartbeats.load(Ordering::Acquire) != 0 && *interval != requested {
+                drop(interval);
+                panic!("[NotSupported] raw watches sharing a URL disagree on keepAlive");
+            }
+            *interval = requested;
+        }
+        self.raw_heartbeats.fetch_add(1, Ordering::AcqRel);
+        RawHeartbeatDriver {
+            client: Arc::clone(self),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drive_heartbeat(self: &Arc<Self>) -> RawHeartbeatDriver {
+        self.drive_heartbeat_with_interval(None)
+    }
+}
+
+/// RAII claim on one socket generation's raw heartbeat cadence.
+pub(crate) struct RawHeartbeatDriver {
+    client: Arc<ClientState>,
+}
+impl Drop for RawHeartbeatDriver {
+    fn drop(&mut self) {
+        self.client.raw_heartbeats.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+#[cfg(test)]
+impl RawHeartbeatDriver {
+    /// Raw-owner drive loops currently sharing this socket's heartbeat window.
+    pub fn peers(&self) -> usize {
+        self.client.raw_heartbeat_drivers()
+    }
+}
 
 struct Outgoing {
     message: Message,
@@ -1032,11 +1165,12 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
     let keepalive_state = state.clone();
     tasks.handles.push(tokio::spawn(async move {
         let _exit = TaskExit(keepalive_state.clone());
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
         interval.tick().await;
         loop {
             interval.tick().await;
-            if !keepalive_state.send_message(Message::Ping(Vec::new())) {
+            if !keepalive_state.generic_keepalive_step() {
                 return;
             }
         }
@@ -1086,6 +1220,9 @@ fn new_slot(url: &str, scope_id: u64) -> Arc<ClientState> {
         connected: Mutex::new(false),
         closed: Mutex::new(false),
         last_pong_ms: Mutex::new(now_ms()),
+        heartbeat_interval: Mutex::new(std::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS)),
+        last_heartbeat: Mutex::new(None),
+        raw_heartbeats: AtomicUsize::new(0),
         mock: Mutex::new(false),
         mock_sent: Mutex::new(Vec::new()),
         ws_test_completed: Mutex::new(false),
@@ -1178,13 +1315,28 @@ pub fn mock_reject_futures(url: &str) {
 pub fn client_value(url: &str) -> Value {
     // Pre-register the slot so subscriptions written on this handle (before the
     // socket connects) persist and read back — upbit-style subscribe building.
-    let c = ensure_slot(url);
-    let mut m = indexmap::IndexMap::new();
-    m.insert("url".to_string(), Value::Str(url.to_string()));
-    m.insert("__ws_reference".to_string(), Value::Str(c.reference()));
-    m.insert("subscriptions".to_string(), c.subscriptions_value());
-    m.insert("futures".to_string(), c.futures_value());
-    Value::Map(m)
+    ensure_slot(url).handle_value()
+}
+
+/// Shorten fixture timing before starting a watch without a configured cadence.
+/// Production uses merged streaming.keepAlive or the existing 30-second default.
+#[cfg(test)]
+pub fn set_heartbeat_interval_for_test(url: &str, interval: std::time::Duration) {
+    *ensure_slot(url).heartbeat_interval.lock().unwrap() = interval;
+}
+
+/// Mock-transport observation helpers for the heartbeat tests: the frames a raw
+/// owner put on the wire, and the raw-owner driver count, without a socket.
+#[cfg(test)]
+pub fn mock_heartbeat_state(url: &str) -> (Value, usize, bool) {
+    match get_client(url) {
+        Some(c) => (
+            c.mock_sent_value(),
+            c.raw_heartbeats.load(Ordering::Acquire),
+            c.control_ping_owned(),
+        ),
+        None => (Value::Array(vec![]), 0, true),
+    }
 }
 
 /// Open-or-join the single-flight for `hash` on `url`, creating the registry
@@ -1322,6 +1474,19 @@ fn hash_str(v: &Value) -> Option<String> {
 }
 
 impl ClientState {
+    /// The client-handle `Value` a venue `ping (client)` receives: this exact
+    /// generation, with live `subscriptions` / `futures` snapshots. Built from the
+    /// live `Arc` (never through the registry) so a heartbeat on a socket this task
+    /// already owns cannot re-enter ownership resolution or panic on a closed scope.
+    pub fn handle_value(&self) -> Value {
+        let mut m = indexmap::IndexMap::new();
+        m.insert("url".to_string(), Value::Str(self.url.clone()));
+        m.insert("__ws_reference".to_string(), Value::Str(self.reference()));
+        m.insert("subscriptions".to_string(), self.subscriptions_value());
+        m.insert("futures".to_string(), self.futures_value());
+        Value::Map(m)
+    }
+
     fn reference(&self) -> String {
         serde_json::to_string(&(self.scope_id, self.generation, &self.url)).unwrap()
     }
@@ -1701,19 +1866,15 @@ mod tests {
         let client = scope.run(ensure_client(&url, None)).await.unwrap();
         // Exact order and no lag for both ready consumers. Wall time is only
         // a hang guard, not a claimed throughput/capacity threshold.
-        let outcomes = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                tokio::join!(drain_burst(client.clone(), FAIRNESS_BURST_FRAMES), async {
-                    for expected in 0..FAIRNESS_BURST_FRAMES {
-                        let frame = raw.recv().await.expect("ready raw consumer lagged");
-                        let row: serde_json::Value =
-                            serde_json::from_slice(&frame.payload).unwrap();
-                        assert_eq!(row["seq"].as_u64(), Some(expected as u64));
-                    }
-                })
-            },
-        )
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(drain_burst(client.clone(), FAIRNESS_BURST_FRAMES), async {
+                for expected in 0..FAIRNESS_BURST_FRAMES {
+                    let frame = raw.recv().await.expect("ready raw consumer lagged");
+                    let row: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+                    assert_eq!(row["seq"].as_u64(), Some(expected as u64));
+                }
+            })
+        })
         .await;
         let report = scope
             .close_and_join(std::time::Duration::from_secs(10))
