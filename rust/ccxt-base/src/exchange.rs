@@ -239,6 +239,8 @@ pub struct Exchange {
     /// (`deepExtend(describe, userConfig)`) instead of relying on per-field
     /// precedence guards in each Core's generated `init()`.
     pub userConfig:             Value,
+    /// Merged venue/constructor WebSocket settings; consumed by raw-owner watches.
+    pub streaming:              Value,
     pub verbose:                Value,
     pub isSandboxModeEnabled:   Value,
 
@@ -510,6 +512,7 @@ impl Exchange {
             rollingWindowSize:    Value::Int(60_000),
             tokenBucket:          Value::Map(HashMap::new()),
             userConfig:           Value::Null,
+            streaming:            Value::Null,
             verbose:              Value::Bool(false),
             isSandboxModeEnabled: Value::Bool(false),
 
@@ -696,6 +699,7 @@ impl Exchange {
         assign(&mut self.timeframes, get("timeframes"));
         assign(&mut self.fees, get("fees"));
         assign(&mut self.features, get("features"));
+        assign(&mut self.streaming, get("streaming"));
         let rate_limit = get("rateLimit");
         if matches!(rate_limit, Value::Int(_) | Value::Float(_)) {
             self.rateLimit = rate_limit;
@@ -746,6 +750,8 @@ impl Exchange {
         if matches!(fetch_history_cache_size, Value::Int(_) | Value::Float(_)) { self.fetchHistoryCacheSize = fetch_history_cache_size; }
         let urls = crate::get_value(cfg, &Value::Str("urls".to_string()));
         if let Value::Dict(_) = urls { self.urls = deep_merge(&self.urls, &urls); }
+        let streaming = crate::get_value(cfg, &Value::Str("streaming".to_string()));
+        if let Value::Dict(_) = streaming { self.streaming = deep_merge(&self.streaming, &streaming); }
         if let Some(v) = safe_string(cfg, "apiKey",        None) { self.apiKey        = Value::Str(v); }
         if let Some(v) = safe_string(cfg, "secret",        None) { self.secret        = Value::Str(v); }
         if let Some(v) = safe_string(cfg, "password",      None) { self.password      = Value::Str(v); }
@@ -1238,10 +1244,48 @@ pub trait ExchangeRuntime: crate::exchange_generated::ExchangeBase {
         // subscribe request. The legacy marker remains supported and is stripped
         // above; neither mechanism sends an extra field on the wire.
         if raw_owner_drain {
+            // Match TS's merged streaming.keepAlive and derived ping(client).
+            // Only raw-owned sockets change: ordinary parsed watches retain the
+            // existing generic task. One per-generation claim serves all batches.
+            let keep_alive = crate::get_value(&self.streaming, &Value::Str("keepAlive".into()));
+            let interval = match keep_alive {
+                Value::Null => None,
+                Value::Int(ms) if ms > 0 => Some(std::time::Duration::from_millis(ms as u64)),
+                Value::Float(ms) if ms.is_finite() && ms > 0.0 && ms.fract() == 0.0
+                    && ms < u64::MAX as f64 => Some(std::time::Duration::from_millis(ms as u64)),
+                _ => panic!("[NotSupported] raw-owner streaming.keepAlive must be positive milliseconds"),
+            };
+            let _heartbeat = client.drive_heartbeat_with_interval(interval);
+            let tick = tokio::time::sleep(client.heartbeat_interval());
+            tokio::pin!(tick);
             loop {
-                match client.next_message().await {
-                    Some(_) => {}
-                    None => panic!("[NetworkError] {} websocket connection closed", url),
+                tokio::select! {
+                    // A ready timer must not starve behind continuously ready
+                    // discard rows. It emits at most one frame, then re-arms.
+                    biased;
+                    _ = &mut tick => {
+                        // Re-read the cadence and re-arm with an absolute deadline:
+                        // a starved loop emits one frame on resume instead of
+                        // replaying every window it slept through. Only the
+                        // claimer emits — one socket, one frame per window,
+                        // however many raw watchers share it.
+                        tick.as_mut()
+                            .reset(tokio::time::Instant::now() + client.heartbeat_interval());
+                        if client.claim_heartbeat(tokio::time::Instant::now()) {
+                            let payload = self
+                                .dispatch_to_derived("ping", vec![client.handle_value()])
+                                .await
+                                .unwrap_or(Value::Null);
+                            // A refused write has already failed the socket; loop so
+                            // the terminal cause surfaces on the next read rather
+                            // than leaving a silent drain behind.
+                            client.send_heartbeat(payload);
+                        }
+                    },
+                    received = client.next_message() => match received {
+                        Some(_) => {}
+                        None => panic!("[NetworkError] {} websocket connection closed", url),
+                    },
                 }
             }
         }

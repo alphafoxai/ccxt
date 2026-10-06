@@ -73,6 +73,44 @@ The reader yields every 32 frames to give ready parsed/raw consumers an opportun
 to run during a buffered burst. This is scheduling fairness, not an increased queue
 bound or a promise that a loaded host can keep up. Genuine lag remains observable.
 
+## Raw-owner heartbeat
+
+Previously a raw-owned socket sent only subscription frames and generic control
+pings, with no venue-level heartbeat dispatch. Bitget requires literal text `ping`
+every 30s; a bounded one-market target probe reset after approximately two minutes
+of valid trades. This is protocol-mismatch evidence, not a parsed-path/live comparison
+or proof that a new binary has recovered. The raw loop now owns the socket heartbeat
+while alive, and the frame is the venue's own: the runtime
+dispatches `ping` on the concrete core with the live client handle, exactly as
+`Exchange.client (url)` binds `this.ping` onto a `WsClient` and `Client.onPingInterval`
+calls it. A venue with no `ping` (binance, gate) answers Null and the runtime sends
+the same RFC-6455 control frame the generic keep-alive sends. No venue URL or payload
+is hardcoded, and no heartbeat path bypasses the outgoing queue/byte bounds — a
+refused frame fails the socket and the drain reports the terminal cause.
+
+Cadence comes from merged `describe().streaming.keepAlive` plus constructor
+configuration, matching TS's reflective constructor assignment (`this[property]`)
+and `client()` merge. The pin declares OKX/Bybit18s, Hyperliquid20s, Binance180s;
+Bitget and absent values use TS `Client.keepAlive`'s30s default. Invalid configured
+cadences or disagreement on a shared URL fail explicitly. This affects raw-owned
+sockets only; ordinary parsed keepalive behavior is unchanged. A due timer is polled
+before discard rows so a buffered price stream cannot suppress the heartbeat. A
+late poll emits one heartbeat, never a catch-up burst.
+
+**The missing-pong deadline remains unimplemented.** TS closes a client whose
+`lastPong` is older than `keepAlive * maxPingPongMisses` (60s by default). This port
+records control-pong time but has no corresponding application-pong parser or
+comparison on either path. This change does not invent that terminal-error surface;
+consumers must not infer blackhole detection or venue liveness from ping emission.
+
+The heartbeat has exactly one owner per socket. Several raw watchers may share a URL
+(per-coin subscriptions on one hyperliquid socket), so the window is claimed on the
+socket by monotonic instant and only the claimer emits: one frame per window, not one
+per watcher. While a raw driver is alive the generic control-ping task stands down, so
+no socket is pinged twice per window by two independent owners; the driver is released
+on return, panic or cancellation, so a cancelled raw watch can never leave the socket
+unpinged.
+
 ## Fixed limits
 
 | Boundary | Limit |
