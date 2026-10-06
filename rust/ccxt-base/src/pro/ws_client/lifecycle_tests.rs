@@ -169,18 +169,24 @@ async fn parsed_queue_exhaustion_is_a_retryable_transport_terminal() {
     }
     let report = scope.close_and_join(BOUND).await;
     assert!(report.cleanup_complete, "{report:?}");
-    assert!(report.failures.iter().any(|failure| {
-        failure.source == ScopeFailureSource::TransportTerminal
-            && failure
-                .message
-                .contains("incoming WebSocket queue capacity exceeded")
-    }), "{report:?}");
-    assert!(!report.failures.iter().any(|failure| {
-        failure.source == ScopeFailureSource::Internal
-            && failure
-                .message
-                .contains("incoming WebSocket queue capacity exceeded")
-    }), "{report:?}");
+    assert!(
+        report.failures.iter().any(|failure| {
+            failure.source == ScopeFailureSource::TransportTerminal
+                && failure
+                    .message
+                    .contains("incoming WebSocket queue capacity exceeded")
+        }),
+        "{report:?}"
+    );
+    assert!(
+        !report.failures.iter().any(|failure| {
+            failure.source == ScopeFailureSource::Internal
+                && failure
+                    .message
+                    .contains("incoming WebSocket queue capacity exceeded")
+        }),
+        "{report:?}"
+    );
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
 }
 

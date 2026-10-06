@@ -89,11 +89,15 @@ is hardcoded, and no heartbeat path bypasses the outgoing queue/byte bounds — 
 refused frame fails the socket and the drain reports the terminal cause.
 
 Cadence comes from merged `describe().streaming.keepAlive` plus constructor
-configuration, matching TS's reflective constructor assignment (`this[property]`)
-and `client()` merge. The pin declares OKX/Bybit18s, Hyperliquid20s, Binance180s;
-Bitget and absent values use TS `Client.keepAlive`'s30s default. Invalid configured
-cadences or disagreement on a shared URL fail explicitly. This affects raw-owned
-sockets only; ordinary parsed keepalive behavior is unchanged. A due timer is polled
+`streaming` configuration, matching TS's reflective constructor assignment
+(`this[property]`) for those fields. The pin declares OKX/Bybit18s, Hyperliquid20s,
+Binance180s; Bitget and absent values use TS `Client.keepAlive`'s30s default.
+This narrow raw-owner seam accepts only positive integral milliseconds or an absent
+value. Unlike TS, `0`/`false` do not disable its heartbeat: unsupported raw-mode
+values and disagreement on a shared URL fail explicitly. TS's additional
+`options.ws.keepAlive` override is not implemented here; no admitted price owner
+uses it. This affects raw-owned sockets only; ordinary parsed keepalive behavior
+is unchanged. A due timer is polled
 before discard rows so a buffered price stream cannot suppress the heartbeat. A
 late poll emits one heartbeat, never a catch-up burst.
 
@@ -157,7 +161,8 @@ actual results belong in the PR evidence; a bounded localhost test does not prov
 recovery scheduling, whole-catalog admission, Engine integration, public exchange
 behavior, production RSS or a long-window soak.
 
-Validated from the fork root with
+Original scoped-transport validation (before the raw-owner heartbeat change) ran
+from the fork root with
 `RUSTC_WRAPPER= CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`:
 
 ```sh
@@ -168,7 +173,7 @@ cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --all-
 cargo clippy --locked --offline --manifest-path rust/ccxt-base/Cargo.toml --features transpiled-base --all-targets -- -D warnings
 ```
 
-Actual results: **80 default tests** (23 lifecycle), **85 transpiled-base tests** passed; three pre-existing doctests remain ignored in each mode. Both
+Those original results: **80 default tests** (23 lifecycle), **85 transpiled-base tests** passed; three pre-existing doctests remain ignored in each mode. Both
 Clippy modes and the targeted rustfmt check passed. Typed-cause regressions cover
 transport → Internal and Internal → transport first-message ordering on real connected
 clients, racing transport/decoder failure, and transport plus two independently awaited

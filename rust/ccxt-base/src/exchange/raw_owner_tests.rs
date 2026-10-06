@@ -576,12 +576,18 @@ async fn raw_heartbeat_uses_merged_venue_keepalive_and_is_not_starved_by_backlog
     let url = heartbeat_url("venue-cadence-backlog");
     ws_client::mock_setup(&url);
     let client = ws_client::get_client(&url).unwrap();
-    let mut exchange = Exchange::new(Some(serde_json::json!({
-        "streaming": { "keepAlive": 18_000 }
-    }).into()));
-    exchange.initialize_properties(serde_json::json!({
-        "streaming": { "keepAlive": 20_000 }
-    }).into());
+    let mut exchange = Exchange::new(Some(
+        serde_json::json!({
+            "streaming": { "keepAlive": 18_000 }
+        })
+        .into(),
+    ));
+    exchange.initialize_properties(
+        serde_json::json!({
+            "streaming": { "keepAlive": 20_000 }
+        })
+        .into(),
+    );
     let mut core = HeartbeatCore {
         exchange,
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -589,7 +595,9 @@ async fn raw_heartbeat_uses_merged_venue_keepalive_and_is_not_starved_by_backlog
     };
     let args = [Value::Null];
     let mut watch = Box::pin(with_raw_owner_drain(core.watch_multiple(
-        Value::Str(url.clone()), Value::List(vec![Value::Str("trade".into())]), &args,
+        Value::Str(url.clone()),
+        Value::List(vec![Value::Str("trade".into())]),
+        &args,
     )));
     assert!(watch.as_mut().now_or_never().is_none());
     for _ in 0..17 {
@@ -599,12 +607,128 @@ async fn raw_heartbeat_uses_merged_venue_keepalive_and_is_not_starved_by_backlog
     }
     assert_eq!(ws_client::mock_sent_messages(&url).len(), 0);
     tokio::time::advance(Duration::from_secs(1)).await;
-    for _ in 0..512 { client.mock_inject_raw(b"{}".to_vec(), false); }
+    for _ in 0..512 {
+        client.mock_inject_raw(b"{}".to_vec(), false);
+    }
     assert!(watch.as_mut().now_or_never().is_none());
     let sent = ws_client::mock_sent_messages(&url);
     drop(watch);
     ws_client::drop_client(&url);
     assert_eq!(sent.to_json(), serde_json::json!(["ping"]));
+}
+
+#[tokio::test]
+async fn invalid_raw_keepalive_is_explicit_and_leaves_no_heartbeat_driver() {
+    use crate::pro::ws_client;
+    use futures::FutureExt;
+    for (index, invalid) in [
+        Value::Int(0),
+        Value::Int(-1),
+        Value::Float(0.5),
+        Value::Float(f64::NAN),
+        Value::Float(f64::INFINITY),
+        Value::Bool(false),
+        Value::Str("30000".into()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let url = heartbeat_url(&format!("invalid-keepalive-{index}"));
+        ws_client::mock_setup(&url);
+        let client = ws_client::get_client(&url).unwrap();
+        let mut core = HeartbeatCore {
+            exchange: Exchange::new(None),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reply: Some(Value::Str("ping".into())),
+        };
+        core.streaming = Value::Map(indexmap::IndexMap::from_iter([(
+            "keepAlive".into(),
+            invalid,
+        )]));
+        let args = [Value::Null];
+        let outcome = std::panic::AssertUnwindSafe(with_raw_owner_drain(core.watch_multiple(
+            Value::Str(url.clone()),
+            Value::List(vec![Value::Str("trade".into())]),
+            &args,
+        )))
+        .catch_unwind()
+        .now_or_never();
+        // Cleanup also happens for the negative discriminator if admission regresses.
+        ws_client::drop_client(&url);
+        let error = match outcome {
+            Some(Err(error)) => error,
+            _ => panic!("invalid cadence {index} was not synchronously rejected"),
+        };
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("raw-owner streaming.keepAlive must be positive milliseconds"),
+            "{message}"
+        );
+        assert_eq!(client.raw_heartbeat_drivers(), 0);
+        assert!(client.control_ping_owned());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_conflicting_cadences_admit_exactly_one_driver_without_poisoning() {
+    use crate::pro::ws_client;
+    let url = heartbeat_url("conflicting-keepalive");
+    ws_client::mock_setup(&url);
+    let client = ws_client::get_client(&url).unwrap();
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let admitted = Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for millis in [18_000, 20_000] {
+        let client = client.clone();
+        let start = start.clone();
+        let admitted = admitted.clone();
+        workers.push(std::thread::spawn(move || {
+            start.wait();
+            let claim = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.drive_heartbeat_with_interval(Some(Duration::from_millis(millis)))
+            }));
+            // Keep the successful driver alive until both admission attempts finish.
+            admitted.wait();
+            claim
+        }));
+    }
+    start.wait();
+    admitted.wait();
+    let claims: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(claims.iter().filter(|claim| claim.is_ok()).count(), 1);
+    assert_eq!(client.raw_heartbeat_drivers(), 1);
+    assert!(matches!(
+        client.heartbeat_interval().as_millis(),
+        18_000 | 20_000
+    ));
+    let rejected = claims
+        .iter()
+        .find_map(|claim| claim.as_ref().err())
+        .unwrap();
+    let message = rejected
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| rejected.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("raw watches sharing a URL disagree on keepAlive"),
+        "{message}"
+    );
+    drop(claims);
+    assert_eq!(client.raw_heartbeat_drivers(), 0);
+    assert!(client.control_ping_owned());
+    // A refused peer must not poison the mutex or pin a dead driver's cadence.
+    let replacement = client.drive_heartbeat_with_interval(Some(Duration::from_millis(25_000)));
+    assert_eq!(client.heartbeat_interval(), Duration::from_millis(25_000));
+    drop(replacement);
+    ws_client::drop_client(&url);
 }
 
 #[tokio::test(start_paused = true)]

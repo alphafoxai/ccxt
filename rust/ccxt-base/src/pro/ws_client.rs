@@ -229,7 +229,9 @@ impl ClientState {
             *interval = requested;
         }
         self.raw_heartbeats.fetch_add(1, Ordering::AcqRel);
-        RawHeartbeatDriver { client: Arc::clone(self) }
+        RawHeartbeatDriver {
+            client: Arc::clone(self),
+        }
     }
 
     #[cfg(test)]
@@ -247,6 +249,7 @@ impl Drop for RawHeartbeatDriver {
         self.client.raw_heartbeats.fetch_sub(1, Ordering::AcqRel);
     }
 }
+#[cfg(test)]
 impl RawHeartbeatDriver {
     /// Raw-owner drive loops currently sharing this socket's heartbeat window.
     pub fn peers(&self) -> usize {
@@ -1162,7 +1165,8 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
     let keepalive_state = state.clone();
     tasks.handles.push(tokio::spawn(async move {
         let _exit = TaskExit(keepalive_state.clone());
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
         interval.tick().await;
         loop {
             interval.tick().await;
@@ -1862,19 +1866,15 @@ mod tests {
         let client = scope.run(ensure_client(&url, None)).await.unwrap();
         // Exact order and no lag for both ready consumers. Wall time is only
         // a hang guard, not a claimed throughput/capacity threshold.
-        let outcomes = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                tokio::join!(drain_burst(client.clone(), FAIRNESS_BURST_FRAMES), async {
-                    for expected in 0..FAIRNESS_BURST_FRAMES {
-                        let frame = raw.recv().await.expect("ready raw consumer lagged");
-                        let row: serde_json::Value =
-                            serde_json::from_slice(&frame.payload).unwrap();
-                        assert_eq!(row["seq"].as_u64(), Some(expected as u64));
-                    }
-                })
-            },
-        )
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(drain_burst(client.clone(), FAIRNESS_BURST_FRAMES), async {
+                for expected in 0..FAIRNESS_BURST_FRAMES {
+                    let frame = raw.recv().await.expect("ready raw consumer lagged");
+                    let row: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+                    assert_eq!(row["seq"].as_u64(), Some(expected as u64));
+                }
+            })
+        })
         .await;
         let report = scope
             .close_and_join(std::time::Duration::from_secs(10))
