@@ -18,6 +18,11 @@ struct ScopeInner {
 struct ScopeState {
     closed: bool,
     clients: Vec<Arc<ClientState>>,
+    /// Explicit payload envelope admitted by this scope, if any caller declared
+    /// one. `None` means every socket this scope creates keeps the default
+    /// envelope. Recorded on the first explicit admission and never silently
+    /// changed afterwards.
+    payload_envelope: Option<PayloadEnvelope>,
 }
 
 /// Owns the exact socket generations accessed by futures passed to [`Self::run`].
@@ -41,6 +46,7 @@ impl ClientScope {
                 state: Mutex::new(ScopeState {
                     closed: false,
                     clients: Vec::new(),
+                    payload_envelope: None,
                 }),
             }),
         }
@@ -49,6 +55,27 @@ impl ClientScope {
     /// call `run`: Tokio task locals are deliberately not inherited by `spawn`.
     pub async fn run<F: Future>(&self, future: F) -> F::Output {
         ACTIVE_SCOPE.scope(self.inner.clone(), future).await
+    }
+    /// Admit the socket for `url` under an explicit payload envelope, recording the
+    /// choice on this scope for future conflict detection.
+    ///
+    /// This is the validated admission seam for a caller that needs more than the
+    /// default 256 KiB wire frame/message envelope: nothing expands implicitly, and a
+    /// request that disagrees with the envelope this scope already recorded, or with
+    /// the envelope already recorded on `url`'s socket, is refused. The ambient
+    /// generated-watch path (`ensure_client`) keeps the default 256 KiB and adopts an
+    /// already admitted slot as-is. Returns the exact generation that owns `url`, so
+    /// `Self::run` drives that same socket.
+    pub fn acquire_with_envelope(
+        &self,
+        url: &str,
+        envelope: PayloadEnvelope,
+    ) -> Result<Arc<ClientState>, String> {
+        acquire_in_scope(&self.inner, url, Some(envelope))
+    }
+    /// Payload envelope this scope explicitly admitted, if any.
+    pub fn payload_envelope(&self) -> Option<PayloadEnvelope> {
+        self.inner.state.lock().unwrap().payload_envelope
     }
     /// Permanently prevent acquisition and request cancellation of owned sockets.
     /// Does not claim a WebSocket close handshake or task join.
@@ -132,7 +159,19 @@ impl Drop for ClientScope {
 /// internal tasks; caller-owned connect/watch futures need separate proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScopeFailureSource {
+    /// The connection is gone: EOF, tungstenite I/O, closed/already-closed, or a
+    /// reset without a closing handshake. The owner may replace the socket after
+    /// cleanup proof.
     TransportTerminal,
+    /// An admitted capacity/admission bound was exhausted, including a wire frame or
+    /// message above the scope's declared payload envelope, a compressed payload
+    /// whose expansion exceeds the decode bound, parsed inbound count/byte
+    /// exhaustion, the outgoing queue/payload/byte budgets and mock capture bounds.
+    ///
+    /// This is independent of the transport: a capacity failure is explicit evidence
+    /// that the declared envelope (or an unchanged queue bound) was too small for
+    /// observed load, and it is never remapped to `TransportTerminal` for a restart.
+    Capacity,
     TaskPanic,
     Internal,
 }
@@ -176,59 +215,128 @@ pub(super) fn scope_id() -> u64 {
     ACTIVE_SCOPE.try_with(|scope| scope.id).unwrap_or(0)
 }
 pub(super) fn acquire_slot(url: &str) -> Arc<ClientState> {
+    acquire_ambient(url).unwrap_or_else(|error| panic!("[NetworkError] {error}"))
+}
+
+/// Explicit-envelope admission for the ambient/task-local caller path. Unlike
+/// [`acquire_slot`] this never panics on an envelope conflict.
+pub(super) fn acquire_slot_with_envelope(
+    url: &str,
+    envelope: PayloadEnvelope,
+) -> Result<Arc<ClientState>, String> {
+    match ACTIVE_SCOPE.try_with(Arc::clone) {
+        Ok(scope) => acquire_in_scope(&scope, url, Some(envelope)),
+        // An explicit non-default envelope has no owner to be scoped to; refusing
+        // here is what keeps "opt-in" explicit instead of ambient.
+        Err(_) if envelope == PayloadEnvelope::Default => acquire_unscoped(url),
+        Err(_) => Err("WebSocket payload envelope request requires a ClientScope owner".to_owned()),
+    }
+}
+
+/// Admit the socket for `url`, and for an explicit request also its payload envelope.
+///
+/// `requested == None` is the ambient path used by the generated watch code: an
+/// already admitted slot is adopted as-is and a new slot gets the scope's recorded
+/// envelope (default when the scope declared none). `requested == Some(envelope)` is
+/// the explicit owner opt-in: a request that disagrees with the scope's recorded
+/// envelope, or with the envelope already recorded on `url`'s socket, is refused
+/// instead of silently shared.
+fn acquire_in_scope(
+    scope: &Arc<ScopeInner>,
+    url: &str,
+    requested: Option<PayloadEnvelope>,
+) -> Result<Arc<ClientState>, String> {
     // Generated Value APIs carry failures by panic. Never panic while holding a
     // registry lock: an ownership rejection must not poison unrelated clients.
-    fn acquire(url: &str) -> Result<Arc<ClientState>, &'static str> {
-        if url.len() > 4096 {
-            return Err("WebSocket URL exceeds limit");
+    if url.len() > 4096 {
+        return Err("WebSocket URL exceeds limit".to_owned());
+    }
+    let mut owner = scope.state.lock().unwrap();
+    if owner.closed {
+        return Err("WebSocket owner is closed".to_owned());
+    }
+    let mut registry = REGISTRY.lock().unwrap();
+    if let Some(client) = registry.get(url) {
+        if client.scope_id != scope.id {
+            return Err("WebSocket URL belongs to another owner".to_owned());
         }
-        match ACTIVE_SCOPE.try_with(Arc::clone) {
-            Ok(scope) => {
-                let mut owner = scope.state.lock().unwrap();
-                if owner.closed {
-                    return Err("WebSocket owner is closed");
-                }
-                let mut registry = REGISTRY.lock().unwrap();
-                if let Some(client) = registry.get(url) {
-                    if client.scope_id != scope.id {
-                        return Err("WebSocket URL belongs to another owner");
-                    }
-                    if !client.is_closed() {
-                        return Ok(client.clone());
-                    }
-                }
-                if owner.clients.len() >= MAX_SCOPE_CLIENTS {
-                    return Err("WebSocket owner generation limit");
-                }
-                if registry.len() >= 1024 && !registry.contains_key(url) {
-                    return Err("WebSocket registry limit");
-                }
-                let client = new_slot(url, scope.id);
-                owner.clients.push(client.clone());
-                registry.insert(url.to_owned(), client.clone());
-                Ok(client)
+        if let Some(requested) = requested {
+            let admitted = client.payload_envelope;
+            if admitted != requested {
+                return Err(format!(
+                    "WebSocket URL is admitted under payload envelope {} not {}",
+                    admitted.name(),
+                    requested.name()
+                ));
             }
-            Err(_) => {
-                let mut registry = REGISTRY.lock().unwrap();
-                if let Some(client) = registry.get(url) {
-                    if client.scope_id != 0 {
-                        return Err("WebSocket URL belongs to a scoped owner");
-                    }
-                    if !client.is_closed() {
-                        return Ok(client.clone());
-                    }
-                    client.request_close();
-                }
-                if registry.len() >= 1024 && !registry.contains_key(url) {
-                    return Err("WebSocket registry limit");
-                }
-                let client = new_slot(url, 0);
-                registry.insert(url.to_owned(), client.clone());
-                Ok(client)
+        }
+        if !client.is_closed() {
+            return Ok(client.clone());
+        }
+    }
+    if let Some(requested) = requested {
+        if let Some(chosen) = owner.payload_envelope {
+            if chosen != requested {
+                return Err(format!(
+                    "WebSocket scope already admitted payload envelope {} not {}",
+                    chosen.name(),
+                    requested.name()
+                ));
             }
         }
     }
-    acquire(url).unwrap_or_else(|error| panic!("[NetworkError] {error}"))
+    if owner.clients.len() >= MAX_SCOPE_CLIENTS {
+        return Err("WebSocket owner generation limit".to_owned());
+    }
+    if registry.len() >= 1024 && !registry.contains_key(url) {
+        return Err("WebSocket registry limit".to_owned());
+    }
+    let envelope = match requested {
+        Some(requested) => {
+            owner.payload_envelope = Some(requested);
+            requested
+        }
+        None => {
+            // Implicit admission also freezes the scope's envelope. A later
+            // explicit call for another URL must not widen an already-used owner.
+            let envelope = owner.payload_envelope.unwrap_or(PayloadEnvelope::Default);
+            owner.payload_envelope = Some(envelope);
+            envelope
+        }
+    };
+    let client = new_slot(url, scope.id, envelope);
+    owner.clients.push(client.clone());
+    registry.insert(url.to_owned(), client.clone());
+    Ok(client)
+}
+
+fn acquire_ambient(url: &str) -> Result<Arc<ClientState>, String> {
+    match ACTIVE_SCOPE.try_with(Arc::clone) {
+        Ok(scope) => acquire_in_scope(&scope, url, None),
+        Err(_) => acquire_unscoped(url),
+    }
+}
+
+fn acquire_unscoped(url: &str) -> Result<Arc<ClientState>, String> {
+    if url.len() > 4096 {
+        return Err("WebSocket URL exceeds limit".to_owned());
+    }
+    let mut registry = REGISTRY.lock().unwrap();
+    if let Some(client) = registry.get(url) {
+        if client.scope_id != 0 {
+            return Err("WebSocket URL belongs to a scoped owner".to_owned());
+        }
+        if !client.is_closed() {
+            return Ok(client.clone());
+        }
+        client.request_close();
+    }
+    if registry.len() >= 1024 && !registry.contains_key(url) {
+        return Err("WebSocket registry limit".to_owned());
+    }
+    let client = new_slot(url, 0, PayloadEnvelope::Default);
+    registry.insert(url.to_owned(), client.clone());
+    Ok(client)
 }
 fn remove_exact(client: &ClientState) {
     let mut registry = REGISTRY.lock().unwrap();
@@ -275,14 +383,14 @@ impl ClientState {
             if let Some(first) = terminal.as_ref() {
                 // Preserve the first message API, but never let an earlier
                 // transport error hide a racing decoder/budget failure. At most
-                // one suppressed Internal per client; actual JoinErrors below
-                // are always appended, never deduplicated.
+                // one suppressed failure of each fatal class per client; actual
+                // JoinErrors below are always appended, never deduplicated.
                 if first.source != source
-                    && source == ScopeFailureSource::Internal
-                    && !tasks
-                        .failures
-                        .iter()
-                        .any(|f| f.source == ScopeFailureSource::Internal)
+                    && matches!(
+                        source,
+                        ScopeFailureSource::Internal | ScopeFailureSource::Capacity
+                    )
+                    && !tasks.failures.iter().any(|f| f.source == source)
                 {
                     tasks.failures.push(failure);
                 }

@@ -10,10 +10,56 @@ use std::mem::size_of;
 
 use crate::Value;
 
-/// Maximum number of bytes accepted from one WebSocket frame before decoding.
-pub(super) const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
-/// Maximum number of bytes a compressed frame may expand to.
+/// Default maximum number of bytes accepted from one WebSocket frame and from
+/// one (possibly fragmented) wire message before decoding.
+pub(super) const DEFAULT_MAX_PAYLOAD_BYTES: usize = 256 * 1024;
+/// Envelope of a scope that explicitly opts in: the smallest power-of-two bound
+/// above the largest recorded single wire message (267291 bytes of Hyperliquid
+/// `trades`). It is an admission bound for one caller-owned scope, **not** a
+/// claim about any venue's maximum payload.
+pub(super) const SCOPED_MAX_PAYLOAD_BYTES: usize = 2 * DEFAULT_MAX_PAYLOAD_BYTES;
+/// Maximum number of bytes a compressed frame may expand to. Unchanged by the
+/// scoped envelope: only the compressed/raw wire bound is opt-in.
 pub(super) const MAX_DECODED_BYTES: usize = 1024 * 1024;
+
+/// Explicit payload admission for one caller-owned scope.
+///
+/// Provenance: the envelope is a transport admission bound, deliberately
+/// independent of any capacity/backpressure classification. A frame appears
+/// oversized only against the envelope its owner declared; nothing here
+/// declares or implies how much memory the venue's stream can cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadEnvelope {
+    /// 256 KiB. Every socket uses this unless its scope explicitly opts in.
+    Default,
+    /// 512 KiB. Opt-in for one explicitly admitted scope; a Hyperliquid trades
+    /// message was recorded at 267291 bytes, and 512 KiB is the next power-of-two
+    /// bound above it.
+    Scoped512KiB,
+}
+
+impl PayloadEnvelope {
+    /// Compressed/raw wire frame and aggregate message ceiling for this envelope.
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::Default => DEFAULT_MAX_PAYLOAD_BYTES,
+            Self::Scoped512KiB => SCOPED_MAX_PAYLOAD_BYTES,
+        }
+    }
+
+    /// Stable label for diagnostics and admission reports.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default-256KiB",
+            Self::Scoped512KiB => "scoped-512KiB",
+        }
+    }
+
+    /// Whether this is an explicit opt-in rather than the default.
+    pub const fn is_scoped(self) -> bool {
+        matches!(self, Self::Scoped512KiB)
+    }
+}
 /// Maximum number of parsed frames retained by the inbound queue.
 ///
 /// A 256-frame queue is too small for a bounded burst from a multi-market
@@ -178,22 +224,36 @@ fn parse_compressed(bytes: &[u8]) -> Option<Value> {
     std::str::from_utf8(bytes).ok().map(parse_text)
 }
 
+/// Typed decoder evidence: never infer budget exhaustion from error text.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DecodeError {
+    Capacity(String),
+    Invalid(String),
+}
+
 /// Decode one raw WebSocket payload under the transport bounds.
 ///
 /// Binary payloads are tried as gzip, then raw deflate. A malformed compressed
 /// stream is allowed to fall through to plain UTF-8/bytes handling; an
 /// expansion overflow is terminal and never falls through to an unbounded raw
 /// interpretation.
-pub(super) fn decode(payload: &[u8], is_binary: bool) -> Result<Value, String> {
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err(format!(
-            "[NetworkError] WebSocket payload exceeds {MAX_PAYLOAD_BYTES} bytes"
-        ));
+pub(super) fn decode(
+    payload: &[u8],
+    is_binary: bool,
+    envelope: PayloadEnvelope,
+) -> Result<Value, DecodeError> {
+    if payload.len() > envelope.bytes() {
+        return Err(DecodeError::Capacity(format!(
+            "[ExchangeError] WebSocket payload exceeds {} bytes",
+            envelope.bytes()
+        )));
     }
 
     if !is_binary {
         let text = std::str::from_utf8(payload).map_err(|error| {
-            format!("[NetworkError] WebSocket text is not valid UTF-8: {error}")
+            DecodeError::Invalid(format!(
+                "[ExchangeError] WebSocket text is not valid UTF-8: {error}"
+            ))
         })?;
         return Ok(parse_text(text));
     }
@@ -205,9 +265,9 @@ pub(super) fn decode(payload: &[u8], is_binary: bool) -> Result<Value, String> {
             }
         }
         Compressed::Overflow => {
-            return Err(format!(
-                "[NetworkError] decoded WebSocket payload exceeds {MAX_DECODED_BYTES} bytes"
-            ));
+            return Err(DecodeError::Capacity(format!(
+                "[ExchangeError] decoded WebSocket payload exceeds {MAX_DECODED_BYTES} bytes"
+            )));
         }
         Compressed::Invalid => {}
     }
@@ -219,9 +279,9 @@ pub(super) fn decode(payload: &[u8], is_binary: bool) -> Result<Value, String> {
             }
         }
         Compressed::Overflow => {
-            return Err(format!(
-                "[NetworkError] decoded WebSocket payload exceeds {MAX_DECODED_BYTES} bytes"
-            ));
+            return Err(DecodeError::Capacity(format!(
+                "[ExchangeError] decoded WebSocket payload exceeds {MAX_DECODED_BYTES} bytes"
+            )));
         }
         Compressed::Invalid => {}
     }
@@ -275,12 +335,33 @@ mod tests {
     }
 
     #[test]
+    fn envelopes_are_256kib_and_512kib_with_frozen_decode_expansion() {
+        assert_eq!(PayloadEnvelope::Default.bytes(), 256 * 1024);
+        assert_eq!(PayloadEnvelope::Scoped512KiB.bytes(), 512 * 1024);
+        assert!(!PayloadEnvelope::Default.is_scoped());
+        assert!(PayloadEnvelope::Scoped512KiB.is_scoped());
+        // Only the wire bound is opt-in; expansion stays 1 MiB for both.
+        assert_eq!(MAX_DECODED_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn decode_bound_follows_the_admitted_envelope() {
+        let payload = vec![b'x'; 300 * 1024];
+        assert!(decode(&payload, true, PayloadEnvelope::Default).is_err());
+        assert!(decode(&payload, false, PayloadEnvelope::Default).is_err());
+        assert!(decode(&payload, true, PayloadEnvelope::Scoped512KiB).is_ok());
+        assert!(decode(&payload, false, PayloadEnvelope::Scoped512KiB).is_ok());
+        let over = vec![b'x'; SCOPED_MAX_PAYLOAD_BYTES + 1];
+        assert!(decode(&over, false, PayloadEnvelope::Scoped512KiB).is_err());
+    }
+
+    #[test]
     fn gzip_expansion_limit_is_accepted() {
         let input = vec![b'x'; MAX_DECODED_BYTES];
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&input).unwrap();
         let compressed = encoder.finish().unwrap();
-        let result = decode(&compressed, true).unwrap();
+        let result = decode(&compressed, true, PayloadEnvelope::Scoped512KiB).unwrap();
         assert_eq!(result.as_str().map(str::len), Some(MAX_DECODED_BYTES));
     }
 
@@ -290,9 +371,9 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&input).unwrap();
         let compressed = encoder.finish().unwrap();
-        let result = decode(&compressed, true);
+        let result = decode(&compressed, true, PayloadEnvelope::Scoped512KiB);
         assert!(
-            matches!(result, Err(message) if message.starts_with("[NetworkError] decoded WebSocket payload"))
+            matches!(result, Err(DecodeError::Capacity(message)) if message.starts_with("[ExchangeError] decoded WebSocket payload"))
         );
     }
 
@@ -303,22 +384,22 @@ mod tests {
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&input).unwrap();
         let compressed = encoder.finish().unwrap();
-        let result = decode(&compressed, true);
+        let result = decode(&compressed, true, PayloadEnvelope::Scoped512KiB);
         assert!(
-            matches!(result, Err(message) if message.starts_with("[NetworkError] decoded WebSocket payload"))
+            matches!(result, Err(DecodeError::Capacity(message)) if message.starts_with("[ExchangeError] decoded WebSocket payload"))
         );
     }
 
     #[test]
     fn invalid_utf8_text_is_rejected() {
-        assert!(decode(&[0xff, 0xfe], false).is_err());
+        assert!(decode(&[0xff, 0xfe], false, PayloadEnvelope::Default).is_err());
     }
 
     #[test]
     fn invalid_utf8_binary_is_retained_as_bytes() {
         let payload = [0x00, 0xff, 0x01];
         assert_eq!(
-            decode(&payload, true).unwrap(),
+            decode(&payload, true, PayloadEnvelope::Default).unwrap(),
             crate::exchange_stubs::bytes_to_value(&payload)
         );
     }
@@ -326,7 +407,10 @@ mod tests {
     #[test]
     fn raw_json_binary_matches_text() {
         let payload = br#"{"channel":"ticker","value":1}"#;
-        assert_eq!(decode(payload, true), decode(payload, false));
+        assert_eq!(
+            decode(payload, true, PayloadEnvelope::Default),
+            decode(payload, false, PayloadEnvelope::Default)
+        );
     }
 
     #[test]
@@ -335,21 +419,27 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         assert!(!compressed.is_empty());
         assert_eq!(
-            decode(&compressed, true).unwrap(),
+            decode(&compressed, true, PayloadEnvelope::Default).unwrap(),
             crate::exchange_stubs::bytes_to_value(&compressed)
         );
     }
 
     #[test]
     fn zero_length_payload_is_safe() {
-        assert_eq!(decode(&[], true).unwrap(), Value::Str(String::new()));
-        assert_eq!(decode(&[], false).unwrap(), Value::Str(String::new()));
+        assert_eq!(
+            decode(&[], true, PayloadEnvelope::Default).unwrap(),
+            Value::Str(String::new())
+        );
+        assert_eq!(
+            decode(&[], false, PayloadEnvelope::Default).unwrap(),
+            Value::Str(String::new())
+        );
     }
 
     #[test]
     fn bare_pong_is_plain_text() {
         assert_eq!(
-            decode(b"pong", false).unwrap(),
+            decode(b"pong", false, PayloadEnvelope::Default).unwrap(),
             Value::Str("pong".to_owned())
         );
     }
