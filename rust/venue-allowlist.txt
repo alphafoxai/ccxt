@@ -1,0 +1,10 @@
+# Venues AlphaFox Market Node compiles. Use as
+#   CCXT_RUST_EXCHANGES=@rust/venue-allowlist.txt
+# (see build/rustVenueAllowlist.ts). Must be closed under REST parents.
+binance
+binanceusdm
+okx
+bybit
+gate
+bitget
+hyperliquid

@@ -31,6 +31,7 @@
 import Transpiler from "ast-transpiler";
 import * as fs from 'fs';
 import * as path from 'path';
+import { venueAllowed } from './rustVenueAllowlist.js';
 
 const TS_BASE_FILE = './ts/src/base/Exchange.ts';
 // The base REST/prediction Cores are READ from here (parents, method surface).
@@ -1159,6 +1160,9 @@ function generateDomain(cfg: DomainCfg, methods: MethodInfo[], baseMethods: Set<
     const allTyped = fs.readdirSync(cfg.outFolder)
         .filter(f => f.endsWith('_typed.rs'))
         .map(f => f.replace(/_typed\.rs$/, ''))
+        // CCXT_RUST_EXCHANGES: list only allowlisted venues (no-op when unset).
+        // Prediction venues share ids with REST ones but are a separate set.
+        .filter(id => cfg.name === 'prediction' || venueAllowed(id))
         .sort();
     // Aggregator: the `TypedExchange` trait for this domain plus a re-export of
     // every wrapper struct, so `use <crate>::Binance;` works — and a `from_id`
@@ -1241,8 +1245,8 @@ function writeTestCoreRegistry(): void {
             .map(f => f.replace(/\.rs$/, ''))
             .sort();
     };
-    const rest = idsIn('./rust/ccxt-base/src/exchanges');
-    const pro = idsIn('./rust/ccxt-pro/src/pro');
+    const rest = idsIn('./rust/ccxt-base/src/exchanges').filter(id => venueAllowed(id));
+    const pro = idsIn('./rust/ccxt-pro/src/pro').filter(id => venueAllowed(id));
     const pred = idsIn('./rust/ccxt-base/src/prediction');
     // A prediction venue that shares an id with a REST one (binance,
     // hyperliquid) keeps the REST Core under the bare name and gets a `Pred`
