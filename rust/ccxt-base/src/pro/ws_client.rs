@@ -22,7 +22,12 @@ mod bounds;
 mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
-use bounds::{ParsedQueue, MAX_PAYLOAD_BYTES, OUTGOING_BYTES, OUTGOING_CAPACITY};
+#[cfg(test)]
+mod payload_envelope_tests;
+pub use bounds::PayloadEnvelope;
+use bounds::{
+    ParsedQueue, DEFAULT_MAX_PAYLOAD_BYTES, MAX_DECODED_BYTES, OUTGOING_BYTES, OUTGOING_CAPACITY,
+};
 pub use lifecycle::{ClientScope, ScopeFailure, ScopeFailureSource, ScopeJoinReport};
 
 use std::collections::{HashMap, HashSet};
@@ -43,6 +48,10 @@ use crate::Value;
 /// background reader/writer tasks and the `watch` drive loop share it.
 pub struct ClientState {
     pub url: String,
+    /// Payload envelope admitted for this exact socket generation. Fixed at
+    /// construction from the owning scope's explicit admission (or the default),
+    /// so a replacement generation cannot silently widen a URL's bound.
+    payload_envelope: PayloadEnvelope,
     /// Frames queued for the writer task → socket.
     outgoing: mpsc::Sender<Outgoing>,
     outgoing_budget: Arc<tokio::sync::Semaphore>,
@@ -117,7 +126,7 @@ struct FlightSlot {
 }
 
 /// Capacity of the bounded reader-boundary raw handoff, per URL.
-/// With MAX_PAYLOAD_BYTES this bounds retained raw payload to 16 MiB per URL.
+/// With the default 256 KiB envelope this bounds retained raw payload to 16 MiB per URL.
 const RAW_BUS_CAPACITY: usize = 64;
 const MAX_RAW_URLS: usize = 256;
 
@@ -271,7 +280,40 @@ fn socket_failure_source(error: &tokio_tungstenite::tungstenite::Error) -> Scope
         | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
             ScopeFailureSource::TransportTerminal
         }
+        Error::Capacity(_) => ScopeFailureSource::Capacity,
         _ => ScopeFailureSource::Internal,
+    }
+}
+
+impl ClientState {
+    fn fail_socket(&self, operation: &str, error: &tokio_tungstenite::tungstenite::Error) {
+        let source = socket_failure_source(error);
+        // Generated JS-throw compatibility is retained, but call_typed must not
+        // also label a capacity/invariant failure as a retryable NetworkError.
+        let kind = if source == ScopeFailureSource::TransportTerminal {
+            "NetworkError"
+        } else {
+            "ExchangeError"
+        };
+        self.fail_with_source(source, format!("[{kind}] {operation}: {error}"));
+    }
+
+    /// Handshake errors occur before reader/writer tasks exist, but an owned
+    /// slot already exists. Preserve capacity there too so stop/join cannot
+    /// report an empty failure list and callers cannot see NetworkError.
+    fn connect_failure(
+        &self,
+        operation: &str,
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> String {
+        if matches!(error, tokio_tungstenite::tungstenite::Error::Capacity(_)) {
+            let message = format!("[ExchangeError] {operation}: {error}");
+            self.fail_capacity(message.clone());
+            message
+        } else {
+            // Keep existing pre-connection behavior for non-capacity errors.
+            format!("[NetworkError] {operation}: {error}")
+        }
     }
 }
 
@@ -413,7 +455,7 @@ fn parse_text(t: &str) -> Value {
 /// use), fall back to the bytes as UTF-8. Then parse as text.
 #[cfg(test)]
 fn parse_binary(b: &[u8]) -> Value {
-    bounds::decode(b, true).expect("valid binary fixture")
+    bounds::decode(b, true, PayloadEnvelope::Default).expect("valid binary fixture")
 }
 
 impl ClientState {
@@ -462,16 +504,32 @@ impl ClientState {
         self.generation
     }
 
+    /// Payload envelope admitted for this socket generation.
+    pub fn payload_envelope(&self) -> PayloadEnvelope {
+        self.payload_envelope
+    }
+
+    /// Record an explicit capacity/admission exhaustion. Kept distinct from the
+    /// transport terminals and from `Internal`: the owner may not treat it as a
+    /// reason to replace the socket, and nothing here maps it to a transport error.
+    pub(super) fn fail_capacity(&self, message: String) {
+        let message = message
+            .strip_prefix("[NetworkError]")
+            .map(|detail| format!("[ExchangeError]{detail}"))
+            .unwrap_or(message);
+        self.fail_with_source(ScopeFailureSource::Capacity, message);
+    }
+
     fn push_incoming(&self, value: Value) {
         if self.is_closed() {
             return;
         }
         let result = self.incoming.lock().unwrap().push(value);
         if let Err(error) = result {
-            // Queue exhaustion is a terminal transport/backpressure condition, not an
-            // unknown internal invariant. The owner may replace the socket after the
-            // scope proves cleanup; decoder failures remain `Internal` in receive_payload.
-            self.fail_with_source(ScopeFailureSource::TransportTerminal, error);
+            // Queue exhaustion is a declared-capacity condition, not an unknown
+            // internal invariant and not a transport failure. The owner must not
+            // remap it to `TransportTerminal` merely to justify a restart.
+            self.fail_capacity(error);
         }
         self.notify.notify_waiters();
     }
@@ -482,7 +540,8 @@ impl ClientState {
         }
         let ingress_at = Instant::now();
         let ingress_unix_ms = now_ms();
-        match bounds::decode(&payload, is_binary) {
+        let envelope = self.payload_envelope;
+        match bounds::decode(&payload, is_binary, envelope) {
             Ok(value) => {
                 // Do not retain spare caller/decoder Vec capacity behind a tiny
                 // payload length. Box conversion gives the bus an exact-size Vec.
@@ -490,7 +549,8 @@ impl ClientState {
                 self.observe_raw(payload, is_binary, ingress_at, ingress_unix_ms);
                 self.push_incoming(value);
             }
-            Err(error) => self.fail(error),
+            Err(bounds::DecodeError::Capacity(error)) => self.fail_capacity(error),
+            Err(bounds::DecodeError::Invalid(error)) => self.fail(error),
         }
     }
 
@@ -498,8 +558,8 @@ impl ClientState {
         if self.is_closed() {
             return false;
         }
-        if message.len() > MAX_PAYLOAD_BYTES {
-            self.fail("[NetworkError] outgoing payload exceeds limit".into());
+        if message.len() > self.payload_envelope.bytes() {
+            self.fail_capacity("[NetworkError] outgoing payload exceeds limit".into());
             return false;
         }
         // Charge retained allocation capacity, not just logical payload length:
@@ -512,7 +572,7 @@ impl ClientState {
             _ => message.len(),
         };
         if bytes > OUTGOING_BYTES {
-            self.fail("[NetworkError] outgoing byte budget exceeded".into());
+            self.fail_capacity("[NetworkError] outgoing byte budget exceeded".into());
             return false;
         }
         let permit = match self
@@ -522,7 +582,7 @@ impl ClientState {
         {
             Ok(permit) => permit,
             Err(_) => {
-                self.fail("[NetworkError] outgoing byte budget exceeded".into());
+                self.fail_capacity("[NetworkError] outgoing byte budget exceeded".into());
                 return false;
             }
         };
@@ -534,7 +594,7 @@ impl ClientState {
             })
             .is_err()
         {
-            self.fail("[NetworkError] outgoing queue full or closed".into());
+            self.fail_capacity("[NetworkError] outgoing queue full or closed".into());
             return false;
         }
         true
@@ -703,6 +763,16 @@ impl ClientState {
         true
     }
 
+    /// Has this generation's watch path registered its subscription intent?
+    /// This read never registers or sends anything, and is not a server ACK.
+    /// A pacing caller must still observe the watch result and terminal state.
+    pub fn has_subscription(&self, subscribe_hash: &str) -> bool {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .contains_key(subscribe_hash)
+    }
+
     /// Record `subscribe_hash` → `subscription`; returns true the first time
     /// (so the caller sends the subscribe frame exactly once). Mirrors TS
     /// `client.subscriptions[subscribeHash] = subscription || true`.
@@ -743,8 +813,8 @@ impl ClientState {
         if self.is_closed() {
             return false;
         }
-        if s.len() > MAX_PAYLOAD_BYTES {
-            self.fail("[NetworkError] outgoing payload exceeds limit".into());
+        if s.len() > self.payload_envelope.bytes() {
+            self.fail_capacity("[NetworkError] outgoing payload exceeds limit".into());
             return false;
         }
         // Fixture capture is bounded too; it does not consume a socket queue.
@@ -752,7 +822,7 @@ impl ClientState {
             let mut sent = self.mock_sent.lock().unwrap();
             if sent.len() >= OUTGOING_CAPACITY {
                 drop(sent);
-                self.fail("[NetworkError] mock capture full".into());
+                self.fail_capacity("[NetworkError] mock capture full".into());
                 return false;
             }
             let value = parse_text(&s);
@@ -763,7 +833,7 @@ impl ClientState {
                 });
             if bytes > OUTGOING_BYTES {
                 drop(sent);
-                self.fail("[NetworkError] mock capture byte budget exceeded".into());
+                self.fail_capacity("[NetworkError] mock capture byte budget exceeded".into());
                 return false;
             }
             sent.push(value);
@@ -994,6 +1064,7 @@ pub fn value_sub_field_write(subref: &str, key: &str, val: Value) {
 async fn connect_via_proxy(
     url: &str,
     proxy: &str,
+    state: &ClientState,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
@@ -1033,9 +1104,10 @@ async fn connect_via_proxy(
         }
         head.push(byte[0]);
         if head.len() > 8192 {
-            return Err(format!(
-                "[NetworkError] ws proxy {proxy} sent an oversized CONNECT reply"
-            ));
+            let message =
+                format!("[ExchangeError] ws proxy {proxy} sent an oversized CONNECT reply");
+            state.fail_capacity(message.clone());
+            return Err(message);
         }
     }
     let status = String::from_utf8_lossy(&head);
@@ -1045,17 +1117,25 @@ async fn connect_via_proxy(
             "[NetworkError] ws proxy {proxy} refused CONNECT: {first}"
         ));
     }
-    let (ws, _resp) =
-        tokio_tungstenite::client_async_tls_with_config(url, stream, Some(socket_config()), None)
-            .await
-            .map_err(|e| format!("[NetworkError] ws connect {url} via {proxy}: {e}"))?;
+    let (ws, _resp) = tokio_tungstenite::client_async_tls_with_config(
+        url,
+        stream,
+        Some(socket_config(state.payload_envelope)),
+        None,
+    )
+    .await
+    .map_err(|e| state.connect_failure(&format!("ws connect {url} via {proxy}"), &e))?;
     Ok(ws)
 }
 
-fn socket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+fn socket_config(
+    envelope: PayloadEnvelope,
+) -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(MAX_PAYLOAD_BYTES),
-        max_frame_size: Some(MAX_PAYLOAD_BYTES),
+        // The wire frame and message ceilings are the scope's admitted envelope;
+        // the compressed-expansion ceiling stays 1 MiB for every scope.
+        max_message_size: Some(envelope.bytes()),
+        max_frame_size: Some(envelope.bytes()),
         write_buffer_size: 0,
         max_write_buffer_size: OUTGOING_BYTES,
         ..Default::default()
@@ -1073,13 +1153,18 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
     if *state.connected.lock().unwrap() {
         return Ok(state);
     }
+    let envelope = state.payload_envelope;
     let connect = async {
         match proxy.as_deref().filter(|p| !p.is_empty()) {
-            Some(p) => connect_via_proxy(url, p).await,
-            None => tokio_tungstenite::connect_async_with_config(url, Some(socket_config()), false)
-                .await
-                .map(|(ws, _)| ws)
-                .map_err(|e| format!("[NetworkError] ws connect: {e}")),
+            Some(p) => connect_via_proxy(url, p, &state).await,
+            None => tokio_tungstenite::connect_async_with_config(
+                url,
+                Some(socket_config(envelope)),
+                false,
+            )
+            .await
+            .map(|(ws, _)| ws)
+            .map_err(|e| state.connect_failure("ws connect", &e)),
         }
     };
     let ws = tokio::select! {
@@ -1109,10 +1194,7 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
         let _exit = TaskExit(writer_state.clone());
         while let Some(outgoing) = rx.recv().await {
             if let Err(error) = write.send(outgoing.message).await {
-                writer_state.fail_with_source(
-                    socket_failure_source(&error),
-                    format!("[NetworkError] writer: {error}"),
-                );
+                writer_state.fail_socket("writer", &error);
                 return;
             }
             // The permit includes the in-flight write, not just queue residency.
@@ -1137,10 +1219,7 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
                     return;
                 }
                 Err(error) => {
-                    reader_state.fail_with_source(
-                        socket_failure_source(&error),
-                        format!("[NetworkError] reader: {error}"),
-                    );
+                    reader_state.fail_socket("reader", &error);
                     return;
                 }
                 _ => {}
@@ -1196,10 +1275,11 @@ fn ensure_slot(url: &str) -> Arc<ClientState> {
     lifecycle::acquire_slot(url)
 }
 
-fn new_slot(url: &str, scope_id: u64) -> Arc<ClientState> {
+fn new_slot(url: &str, scope_id: u64, payload_envelope: PayloadEnvelope) -> Arc<ClientState> {
     let (tx, rx) = mpsc::channel(OUTGOING_CAPACITY);
     Arc::new(ClientState {
         url: url.to_string(),
+        payload_envelope,
         outgoing: tx,
         outgoing_budget: Arc::new(tokio::sync::Semaphore::new(OUTGOING_BYTES)),
         scope_id,
@@ -1627,8 +1707,10 @@ mod tests {
         let url = spawn_mock_server().await;
         let client = ensure_client(&url, None).await.expect("connect");
 
-        // Send a subscribe frame once (idempotent per hash).
+        // A read-only lookup cannot elect the subscription sender.
+        assert!(!client.has_subscription("ticker:BTC/USDT"));
         assert!(client.subscribe_once("ticker:BTC/USDT", Value::Null));
+        assert!(client.has_subscription("ticker:BTC/USDT"));
         assert!(!client.subscribe_once("ticker:BTC/USDT", Value::Null));
         assert!(client.send_text("{\"op\":\"subscribe\",\"channel\":\"ticker\"}".to_string()));
 

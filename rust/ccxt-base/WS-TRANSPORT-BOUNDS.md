@@ -27,16 +27,25 @@ failure and is unchanged: terminal transport errors keep `cleanup_complete`
 true while `all_joined()` stays false. Aborted **and awaited** reader/writer/keepalive tasks count as joined: this
 proves task destruction, not a graceful WebSocket close handshake.
 
-Failures are typed `ScopeFailure { source, message }`, preserving the original text.
+Failures are typed `ScopeFailure { source, message }`, preserving the underlying error text.
 `TransportTerminal` is assigned at EOF, for tungstenite I/O, closed/already-closed,
-and reset-without-closing-handshake variants, and for parsed incoming count/byte
-exhaustion (the merged price-queue classification change). Decoder, UTF-8, payload,
-outgoing budget, other protocol and unknown errors remain `Internal`; awaited task
-panics are `TaskPanic`.
-No classification parses error text. The first terminal message remains available via
-`terminal_error()`. A racing later Internal cannot be hidden by that first message:
-one suppressed Internal per client is retained in `Tasks.failures`; actual non-cancelled
-JoinErrors are always appended. This is bounded fatal-cause evidence, not a complete
+and reset-without-closing-handshake variants. Explicit wire-message/frame, decode
+expansion, parsed incoming count/byte and outgoing budget failures are `Capacity`,
+not a normal disconnect. This deliberately corrects the earlier parsed-queue
+`TransportTerminal` classification: a capacity failure must not become an accepted
+periodic rotation. UTF-8/decoder invariants, other protocol and unknown failures
+remain `Internal`; awaited task panics are `TaskPanic`.
+Classification uses typed tungstenite/decoder variants and the failing budget check,
+never an error-message substring. Capacity's constructed JS-throw prefix is
+`[ExchangeError]`, not `[NetworkError]`; `call_typed` still catches that throw, and
+scope evidence independently identifies `Capacity`. This also covers typed
+`Capacity` before WebSocket establishment (direct and proxy upgrade handshakes)
+and the explicit8192-byte proxy CONNECT header bound: the already-owned slot
+retains the failure even though no reader task exists yet. Ordinary handshake
+I/O errors retain their existing NetworkError behavior. The first terminal message
+remains available via `terminal_error()`. Later Capacity and Internal cannot be hidden
+by an earlier transport message: one suppressed failure per fatal source/client is
+retained in `Tasks.failures`; actual non-cancelled JoinErrors are always appended. This is bounded fatal-cause evidence, not a complete
 per-error audit. Record locking is tasks → error; both are released before cancellation.
 Consumers must inspect every failure independently of cleanup proof.
 
@@ -115,7 +124,35 @@ no socket is pinged twice per window by two independent owners; the driver is re
 on return, panic or cancellation, so a cancelled raw watch can never leave the socket
 unpinged.
 
-## Fixed limits
+## Explicit scoped payload envelope
+
+The default is still 256 KiB. An owning caller can explicitly call
+`scope.acquire_with_envelope(url, PayloadEnvelope::Scoped512KiB)` before its first
+watch. The ordinary `scope.run(ensure_client(...))`/generated watch adopts that same
+slot and envelope; no alternate connect/heartbeat/watch implementation is added.
+First acquisition fixes the scope envelope, including implicit default acquisition.
+A later conflicting request, a foreign URL owner or a closed scope is refused.
+`ClientScope::payload_envelope()` and `ClientState::payload_envelope()` expose the
+admitted value, not an environment-variable override. No generated venue code opts
+itself in: the Market Node HL owner is responsible for its approved 512 KiB opt-in.
+All ordinary callers and the other five price venues remain on the default.
+
+Frame **and** fragmented-message limits, raw ingress and outgoing payload checks use
+the selected envelope. Decode expansion stays 1 MiB and no queue count/byte budget
+increases. At 512 KiB the 64-entry URL and 256-entry global raw rings have conservative
+payload maxima of 32 MiB and 128 MiB, respectively; these are not whole-process RSS
+claims. Overwrite still produces explicit `Lagged`; a reader must never treat it as
+loss-free operation. The recorded 267291-byte failure fits this envelope, but no
+upper bound for all future venue messages is claimed.
+
+`ClientState::has_subscription(hash)` is a bounded read-only registration lookup.
+It neither sends nor elects a subscription, and is **not a server ACK**. A caller
+pacing generated watches can wait for actual registration before releasing the next
+watch instead of letting a delayed handshake accumulate an eventual subscribe burst.
+Watch result/terminal monitoring remains mandatory; polling a watch once is not
+proof that it reached subscription admission.
+
+## Fixed limits (default envelope unless explicitly noted)
 
 | Boundary | Limit |
 | --- | --- |
@@ -154,6 +191,21 @@ no receivers. Active subscribers keep their channel across socket generation cha
 The global observer has a single fixed bus, not one entry per URL.
 
 ## Validation scope
+
+Scoped-envelope regressions use the ordinary owned connection on physical localhost
+sockets: valid JSON of 267291 bytes fails by default and passes with explicit opt-in;
+both inclusive boundaries pass, one byte over fails with `Capacity`, fragmented
+aggregates cannot evade the ceiling, and gzip expansion over 1 MiB is independently
+refused. Existing transport/UTF-8/panic and late fatal-cause proofs remain distinct.
+
+The ignored `scoped_ring_retention_is_bounded_and_overwrite_is_explicit` measurement
+must be invoked explicitly in an isolated Linux process/cgroup. It retains 512 KiB
+raw frames beyond both ring capacities while draining the parsed queue, asserts the
+fixed 64/256 counts and exact `Lagged` losses, then joins the owner. A development
+Linux arm64 run with 0.5 CPU, 256 MiB memory and swap disabled exited 0; cgroup peak
+was 181395456 bytes, OOM counters zero. That is a bounded transport-retention case,
+not the price-service catalog/cache RSS or target capacity acceptance. Re-run against
+the final producer SHA and verify the actual container budgets in the full topology.
 
 Tests use in-process socket-free fixtures or physical `127.0.0.1` WebSocket peers.
 No credentials or public exchange requests are needed. Explicit test commands and

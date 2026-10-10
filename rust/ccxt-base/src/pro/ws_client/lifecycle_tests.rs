@@ -4,6 +4,12 @@ use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 const BOUND: Duration = Duration::from_secs(2);
 
+/// Local rootless peers are likewise `TransportTerminal`: both sides treat an EOF as
+/// a terminal transport fact, not a bug in the code under test.
+fn local_eof_source() -> ScopeFailureSource {
+    ScopeFailureSource::TransportTerminal
+}
+
 async fn server() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -106,12 +112,15 @@ fn typed_socket_failure_sources_never_inspect_text() {
             ScopeFailureSource::TransportTerminal
         );
     }
-    for error in [
-        Error::Utf8,
-        Error::Capacity(CapacityError::MessageTooLong {
+    assert_eq!(
+        socket_failure_source(&Error::Capacity(CapacityError::MessageTooLong {
             size: 2,
             max_size: 1,
-        }),
+        })),
+        ScopeFailureSource::Capacity
+    );
+    for error in [
+        Error::Utf8,
         Error::Protocol(ProtocolError::UnmaskedFrameFromClient),
     ] {
         assert_eq!(socket_failure_source(&error), ScopeFailureSource::Internal);
@@ -126,7 +135,11 @@ async fn concurrent_transport_and_decoder_failure_retain_internal() {
     let barrier = Arc::new(std::sync::Barrier::new(2));
     // Both caller-owned operations have passed the open check. Freeze the
     // decoder result before racing its fail call with a transport terminal.
-    let invalid = bounds::decode(&vec![0; MAX_PAYLOAD_BYTES + 1], false).unwrap_err();
+    let bounds::DecodeError::Invalid(invalid) =
+        bounds::decode(&[0xff], false, PayloadEnvelope::Default).unwrap_err()
+    else {
+        panic!("invalid UTF-8 must stay a decoder invariant");
+    };
     let transport_client = Arc::clone(&client);
     let transport_barrier = Arc::clone(&barrier);
     let transport = tokio::task::spawn_blocking(move || {
@@ -160,7 +173,7 @@ async fn concurrent_transport_and_decoder_failure_retain_internal() {
 }
 
 #[tokio::test]
-async fn parsed_queue_exhaustion_is_a_retryable_transport_terminal() {
+async fn parsed_queue_exhaustion_is_capacity_not_retryable_transport() {
     let (url, peer) = server().await;
     let scope = ClientScope::new();
     let client = scope.run(ensure_client(&url, None)).await.unwrap();
@@ -171,7 +184,7 @@ async fn parsed_queue_exhaustion_is_a_retryable_transport_terminal() {
     assert!(report.cleanup_complete, "{report:?}");
     assert!(
         report.failures.iter().any(|failure| {
-            failure.source == ScopeFailureSource::TransportTerminal
+            failure.source == ScopeFailureSource::Capacity
                 && failure
                     .message
                     .contains("incoming WebSocket queue capacity exceeded")
@@ -180,10 +193,12 @@ async fn parsed_queue_exhaustion_is_a_retryable_transport_terminal() {
     );
     assert!(
         !report.failures.iter().any(|failure| {
-            failure.source == ScopeFailureSource::Internal
-                && failure
-                    .message
-                    .contains("incoming WebSocket queue capacity exceeded")
+            matches!(
+                failure.source,
+                ScopeFailureSource::Internal | ScopeFailureSource::TransportTerminal
+            ) && failure
+                .message
+                .contains("incoming WebSocket queue capacity exceeded")
         }),
         "{report:?}"
     );
@@ -374,13 +389,13 @@ async fn outgoing_frame_count_and_bytes_are_independent_terminal_limits() {
         ),
         (
             "fixture-out-bytes",
-            "x".repeat(MAX_PAYLOAD_BYTES),
-            OUTGOING_BYTES / MAX_PAYLOAD_BYTES,
+            "x".repeat(DEFAULT_MAX_PAYLOAD_BYTES),
+            OUTGOING_BYTES / DEFAULT_MAX_PAYLOAD_BYTES,
             "byte",
         ),
         (
             "fixture-out-payload",
-            "x".repeat(MAX_PAYLOAD_BYTES + 1),
+            "x".repeat(DEFAULT_MAX_PAYLOAD_BYTES + 1),
             0,
             "payload",
         ),
@@ -397,7 +412,7 @@ async fn outgoing_frame_count_and_bytes_are_independent_terminal_limits() {
         let terminal = scope.close_and_join(BOUND).await;
         assert!(!terminal.all_joined());
         assert!(terminal.cleanup_complete, "{terminal:?}");
-        assert_eq!(terminal.failures[0].source, ScopeFailureSource::Internal);
+        assert_eq!(terminal.failures[0].source, ScopeFailureSource::Capacity);
     }
 }
 
@@ -454,7 +469,7 @@ async fn raw_overflow_reports_lag_and_payload_cap_is_not_bypassed() {
         raw.recv().await,
         Err(broadcast::error::RecvError::Lagged(1))
     ));
-    client.mock_inject_raw(vec![0; MAX_PAYLOAD_BYTES + 1], true);
+    client.mock_inject_raw(vec![0; DEFAULT_MAX_PAYLOAD_BYTES + 1], true);
     assert!(client.terminal_error().unwrap().contains("payload"));
     let payload = scope.close_and_join(BOUND).await;
     assert!(!payload.all_joined());
@@ -473,7 +488,7 @@ async fn socket_rejects_fragmented_aggregate_over_wire_limit() {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
         let first = Frame::message(
-            vec![b'x'; MAX_PAYLOAD_BYTES],
+            vec![b'x'; DEFAULT_MAX_PAYLOAD_BYTES],
             OpCode::Data(Data::Text),
             false,
         );
@@ -499,7 +514,7 @@ async fn socket_rejects_fragmented_aggregate_over_wire_limit() {
     assert_eq!(report.tasks_joined, 3);
     assert!(!report.all_joined() && !report.timed_out);
     assert!(report.cleanup_complete, "{report:?}");
-    assert_eq!(report.failures[0].source, ScopeFailureSource::Internal);
+    assert_eq!(report.failures[0].source, ScopeFailureSource::Capacity);
     tokio::time::timeout(BOUND, peer).await.unwrap().unwrap();
 }
 
@@ -626,7 +641,7 @@ async fn mock_capture_has_an_aggregate_byte_budget() {
         .await;
     client.mock_enable();
     for _ in 0..5 {
-        if !client.send_text("x".repeat(MAX_PAYLOAD_BYTES)) {
+        if !client.send_text("x".repeat(DEFAULT_MAX_PAYLOAD_BYTES)) {
             break;
         }
     }
@@ -637,3 +652,40 @@ async fn mock_capture_has_an_aggregate_byte_budget() {
     assert!(client.mock_sent.lock().unwrap().len() < OUTGOING_CAPACITY);
     assert!(!scope.close_and_join(BOUND).await.all_joined());
 }
+
+#[tokio::test]
+async fn raw_oversize_and_expansion_exhaustion_are_capacity_not_internal_or_transport() {
+    let scope = ClientScope::new();
+    let client = scope
+        .run(async {
+            let client = ensure_slot("fixture-capacity-classification");
+            client.mock_enable();
+            client
+        })
+        .await;
+    // A wire payload above what this default scope admitted is `Capacity`: it is
+    // evidence the declared envelope was too small, not a transport failure that
+    // justifies replacing the socket.
+    client.mock_inject_raw(vec![0; DEFAULT_MAX_PAYLOAD_BYTES + 1], false);
+    let report = scope.close_and_join(BOUND).await;
+    assert!(report.cleanup_complete, "{report:?}");
+    assert!(!report.all_joined(), "{report:?}");
+    assert_eq!(report.failures[0].source, ScopeFailureSource::Capacity);
+    assert!(report.failures[0].message.contains("payload exceeds"));
+}
+
+#[tokio::test]
+async fn outgoing_budget_exhaustion_is_capacity_not_transport() {
+    let scope = ClientScope::new();
+    let client = scope
+        .run(async { ensure_slot("fixture-capacity-outgoing-class") })
+        .await;
+    assert!(!client.send_text("x".repeat(DEFAULT_MAX_PAYLOAD_BYTES + 1)));
+    let report = scope.close_and_join(BOUND).await;
+    assert!(report.cleanup_complete, "{report:?}");
+    assert!(!report.all_joined(), "{report:?}");
+    assert_eq!(report.failures[0].source, ScopeFailureSource::Capacity);
+    assert!(report.failures[0].message.contains("payload exceeds"));
+}
+
+// Physical envelope proofs are in sibling payload_envelope_tests.rs.
