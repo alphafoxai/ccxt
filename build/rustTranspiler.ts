@@ -8,6 +8,7 @@ import fs from 'fs';
 import log from 'ololog';
 import ansi from 'ansicolor';
 import { isMainEntry } from "./transpile.js";
+import { venueAllowed } from './rustVenueAllowlist.js';
 import errorHierarchy from '../js/src/base/errorHierarchy.js';
 
 ansi.nice;
@@ -6797,6 +6798,7 @@ impl std::ops::DerefMut for ${coreName} {
         if (folder === EXCHANGES_WS_FOLDER) {
             const venues = names
                 .filter(n => n !== 'mod' && !n.endsWith('_api') && !n.endsWith('_typed'))
+                .filter(n => venueAllowed(n)) // CCXT_RUST_EXCHANGES allowlist (no-op when unset)
                 .sort();
             const wsLines = [
                 '// Re-export the hand-written pro infra (cache / order_book /',
@@ -6835,7 +6837,8 @@ impl std::ops::DerefMut for ${coreName} {
         const baseNames = names.filter(
             n => !n.endsWith('_api')
               && !n.endsWith('_typed')
-              && !HAND_WRITTEN_SIBLINGS.has(n),
+              && !HAND_WRITTEN_SIBLINGS.has(n)
+              && (folder !== EXCHANGES_FOLDER || venueAllowed(n)), // CCXT_RUST_EXCHANGES allowlist (no-op when unset)
         );
         const lines: string[] = [];
         for (const sibling of HAND_WRITTEN_SIBLINGS) {
