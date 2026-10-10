@@ -22,6 +22,8 @@ mod bounds;
 mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod scoped_raw_tests;
 use bounds::{ParsedQueue, MAX_PAYLOAD_BYTES, OUTGOING_BYTES, OUTGOING_CAPACITY};
 pub use lifecycle::{ClientScope, ScopeFailure, ScopeFailureSource, ScopeJoinReport};
 
@@ -47,6 +49,7 @@ pub struct ClientState {
     outgoing: mpsc::Sender<Outgoing>,
     outgoing_budget: Arc<tokio::sync::Semaphore>,
     scope_id: u64,
+    raw_handoff: Option<mpsc::Sender<RawFrame>>,
     tasks: Mutex<lifecycle::Tasks>,
     join_gate: tokio::sync::Mutex<()>,
     close_notify: Notify,
@@ -477,6 +480,10 @@ impl ClientState {
     }
 
     fn receive_payload(&self, payload: Vec<u8>, is_binary: bool) {
+        if self.raw_handoff.is_some() {
+            self.fail("[NetworkError] scoped raw handoff requires async reader".into());
+            return;
+        }
         if self.is_closed() {
             return;
         }
@@ -492,6 +499,71 @@ impl ClientState {
             }
             Err(error) => self.fail(error),
         }
+    }
+
+    async fn receive_payload_async(&self, payload: Vec<u8>, is_binary: bool) {
+        let Some(sender) = &self.raw_handoff else {
+            self.receive_payload(payload, is_binary);
+            return;
+        };
+        let closing = self.close_notify.notified();
+        tokio::pin!(closing);
+        closing.as_mut().enable();
+        if self.is_closed() {
+            return;
+        }
+        let ingress_at = Instant::now();
+        let ingress_unix_ms = now_ms();
+        let value = match bounds::decode(&payload, is_binary) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        let frame = RawFrame {
+            url: self.url.clone(),
+            generation: self.generation,
+            ingress_at,
+            ingress_unix_ms,
+            is_binary,
+            payload: payload.into_boxed_slice().into_vec(),
+        };
+        // No synchronous lock survives this wait. Retained input is one current
+        // frame/value per reader, in addition to the fixed 256-slot scope FIFO.
+        let reservation = tokio::select! {
+            biased;
+            _ = &mut closing => return,
+            result = tokio::time::timeout(std::time::Duration::from_secs(1), sender.reserve()) => result,
+        };
+        let permit = match reservation {
+            Ok(Ok(permit)) => permit,
+            other => {
+                self.fail_raw_handoff(
+                    match other {
+                        Err(_) => "[NetworkError] raw handoff deadline exceeded",
+                        _ => "[NetworkError] raw handoff receiver closed",
+                    }
+                    .into(),
+                );
+                return;
+            }
+        };
+        // Serialize final admission with request_close without awaiting under
+        // this lock. A frame reserved before cancellation cannot arrive after it.
+        let closed = self.closed.lock().unwrap();
+        if *closed {
+            return;
+        }
+        self.observe_raw(
+            frame.payload.clone(),
+            is_binary,
+            ingress_at,
+            ingress_unix_ms,
+        );
+        permit.send(frame);
+        drop(closed);
+        self.push_incoming(value);
     }
 
     fn send_message(&self, message: Message) -> bool {
@@ -1126,8 +1198,12 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
         let mut since_yield = 0;
         while let Some(frame) = read.next().await {
             match frame {
-                Ok(Message::Text(text)) => reader_state.receive_payload(text.into_bytes(), false),
-                Ok(Message::Binary(bytes)) => reader_state.receive_payload(bytes, true),
+                Ok(Message::Text(text)) => {
+                    reader_state
+                        .receive_payload_async(text.into_bytes(), false)
+                        .await
+                }
+                Ok(Message::Binary(bytes)) => reader_state.receive_payload_async(bytes, true).await,
                 Ok(Message::Pong(_)) => reader_state.on_pong(),
                 Ok(Message::Ping(bytes)) => {
                     reader_state.send_message(Message::Pong(bytes));
@@ -1196,13 +1272,18 @@ fn ensure_slot(url: &str) -> Arc<ClientState> {
     lifecycle::acquire_slot(url)
 }
 
-fn new_slot(url: &str, scope_id: u64) -> Arc<ClientState> {
+fn new_slot(
+    url: &str,
+    scope_id: u64,
+    raw_handoff: Option<mpsc::Sender<RawFrame>>,
+) -> Arc<ClientState> {
     let (tx, rx) = mpsc::channel(OUTGOING_CAPACITY);
     Arc::new(ClientState {
         url: url.to_string(),
         outgoing: tx,
         outgoing_budget: Arc::new(tokio::sync::Semaphore::new(OUTGOING_BYTES)),
         scope_id,
+        raw_handoff,
         tasks: Mutex::new(lifecycle::Tasks::default()),
         join_gate: tokio::sync::Mutex::new(()),
         close_notify: Notify::new(),
