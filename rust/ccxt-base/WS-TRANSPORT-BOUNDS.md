@@ -73,6 +73,42 @@ The reader yields every 32 frames to give ready parsed/raw consumers an opportun
 to run during a buffered burst. This is scheduling fairness, not an increased queue
 bound or a promise that a loaded host can keep up. Genuine lag remains observable.
 
+## Opt-in scoped raw admission
+
+`ClientScope::new_with_raw_handoff()` returns `(ClientScope, mpsc::Receiver<RawFrame>)`.
+The scope owns one FIFO of **256** raw frames across all its socket generations,
+created before any watch starts. Only readers acquired in `scope.run(...)` send to
+it. Default `ClientScope::new()`, ordinary watch APIs and the legacy lossy URL/global
+broadcast taps keep their behavior; they are not the authoritative path for this mode.
+
+The real reader decodes and stamps each frame at initial ingress, then reserves a
+slot asynchronously. Its original URL, generation, monotonic instant and wall-clock
+stamp survive the wait. Full admission backpressures the socket reader for at most
+**one second**; this fixed ceiling is a failure bound, not a freshness promise.
+Deadline or receiver loss is `Internal`, not recoverable source discontinuity or a
+fallback to the broadcast bus. This mode requires a live consumer and the parsed
+raw-owner drain above. Synchronous `mock_inject_raw` on an opted-in client fails
+explicitly instead of bypassing async admission; real socket tests cover this mode.
+
+No standard/registry/scope mutex is held across admission. Cancellation closes the
+exact generation and serializes against final send and failure recording; a queued
+cancellation cannot leave a post-close send or a false admission failure. The FIFO
+receiver may call `close()` and drain already accepted frames after source close.
+A retained scope keeps its sender, so callers should not await EOF without closing
+admission themselves. The usual caller-task and internal-scope join proof remains
+required; no new cleanup, forwarding or collector task is introduced.
+
+Worst-case retained raw payload is 256 × 256 KiB = 64 MiB **per opted-in scope**, plus
+one bounded raw payload and decoded value per active reader waiting for admission.
+Legacy tap storage, parsed queues, socket buffers and application relays are separate
+budgets; this is not a total RSS bound. Legacy observers can still report `Lagged`
+independently without corrupting a successfully admitted scoped FIFO.
+
+Tests in `src/pro/ws_client/scoped_raw_tests.rs` cover 600 real localhost frames with
+consumer suspension, deadline, receiver loss, cancel/join, cancel/failure ordering,
+replacement generation, scope isolation and legacy lag. They establish transport
+contracts only, not production capacity or full application recovery.
+
 ## Raw-owner heartbeat
 
 Previously a raw-owned socket sent only subscription frames and generic control
