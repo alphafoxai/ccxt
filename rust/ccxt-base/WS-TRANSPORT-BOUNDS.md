@@ -38,7 +38,11 @@ remain `Internal`; awaited task panics are `TaskPanic`.
 Classification uses typed tungstenite/decoder variants and the failing budget check,
 never an error-message substring. Capacity's constructed JS-throw prefix is
 `[ExchangeError]`, not `[NetworkError]`; `call_typed` still catches that throw, and
-scope evidence independently identifies `Capacity`. The first terminal message
+scope evidence independently identifies `Capacity`. This also covers typed
+`Capacity` before WebSocket establishment (direct and proxy upgrade handshakes)
+and the explicit8192-byte proxy CONNECT header bound: the already-owned slot
+retains the failure even though no reader task exists yet. Ordinary handshake
+I/O errors retain their existing NetworkError behavior. The first terminal message
 remains available via `terminal_error()`. Later Capacity and Internal cannot be hidden
 by an earlier transport message: one suppressed failure per fatal source/client is
 retained in `Tasks.failures`; actual non-cancelled JoinErrors are always appended. This is bounded fatal-cause evidence, not a complete

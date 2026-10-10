@@ -307,3 +307,110 @@ async fn scoped_ring_retention_is_bounded_and_overwrite_is_explicit() {
     );
     assert!(scope.close_and_join(BOUND).await.all_joined());
 }
+
+#[tokio::test]
+async fn direct_and_proxy_handshake_capacity_remains_typed_and_nontransport() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for case in 0..3 {
+        let through_proxy = case != 0;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = if through_proxy {
+            "ws://fixture.invalid/handshake-limit".to_string()
+        } else {
+            format!("ws://{address}/handshake-limit")
+        };
+        let proxy = through_proxy.then(|| format!("http://{address}"));
+        let peer = tokio::spawn(async move {
+            tokio::time::timeout(BOUND, async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                async fn headers(stream: &mut tokio::net::TcpStream) {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 8192);
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                    }
+                }
+                if through_proxy {
+                    headers(&mut stream).await;
+                    if case == 2 {
+                        let reply = format!(
+                            "HTTP/1.1 200 Connection established\r\nX-Limit: {}",
+                            "x".repeat(8193)
+                        );
+                        stream.write_all(reply.as_bytes()).await.unwrap();
+                        return;
+                    }
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                headers(&mut stream).await;
+                // More than tungstenite's handshake parser permits, without a
+                // huge payload or public connection. CapacityError::TooManyHeaders.
+                let mut response = "HTTP/1.1 101 Switching Protocols\r\n".to_string();
+                for i in 0..256 {
+                    response.push_str(&format!("X-Bound-{i}: x\r\n"));
+                }
+                response.push_str("\r\n");
+                stream.write_all(response.as_bytes()).await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        let scope = ClientScope::new();
+        let result = tokio::time::timeout(BOUND, scope.run(ensure_client(&url, proxy)))
+            .await
+            .unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("oversized handshake accepted"),
+        };
+        let report = scope.close_and_join(BOUND).await;
+        peer.await.unwrap();
+        assert!(report.cleanup_complete, "{report:?}");
+        assert!(
+            error.starts_with("[ExchangeError]"),
+            "capacity became retryable: {error}; {report:?}"
+        );
+        assert!(
+            !report.failures.is_empty(),
+            "missing pre-socket failure evidence: {report:?}"
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|failure| failure.source == ScopeFailureSource::Capacity),
+            "{report:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_closed_during_handshake_keeps_existing_network_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/early-close", listener.local_addr().unwrap());
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let scope = ClientScope::new();
+    let result = tokio::time::timeout(BOUND, scope.run(ensure_client(&url, None)))
+        .await
+        .unwrap();
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("closed handshake accepted"),
+    };
+    let report = scope.close_and_join(BOUND).await;
+    peer.await.unwrap();
+    assert!(error.starts_with("[NetworkError]"), "{error}");
+    assert!(
+        report.cleanup_complete && report.failures.is_empty(),
+        "{report:?}"
+    );
+}

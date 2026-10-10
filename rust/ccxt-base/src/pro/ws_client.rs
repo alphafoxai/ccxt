@@ -297,6 +297,24 @@ impl ClientState {
         };
         self.fail_with_source(source, format!("[{kind}] {operation}: {error}"));
     }
+
+    /// Handshake errors occur before reader/writer tasks exist, but an owned
+    /// slot already exists. Preserve capacity there too so stop/join cannot
+    /// report an empty failure list and callers cannot see NetworkError.
+    fn connect_failure(
+        &self,
+        operation: &str,
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> String {
+        if matches!(error, tokio_tungstenite::tungstenite::Error::Capacity(_)) {
+            let message = format!("[ExchangeError] {operation}: {error}");
+            self.fail_capacity(message.clone());
+            message
+        } else {
+            // Keep existing pre-connection behavior for non-capacity errors.
+            format!("[NetworkError] {operation}: {error}")
+        }
+    }
 }
 
 struct TaskExit(Arc<ClientState>);
@@ -1046,7 +1064,7 @@ pub fn value_sub_field_write(subref: &str, key: &str, val: Value) {
 async fn connect_via_proxy(
     url: &str,
     proxy: &str,
-    envelope: PayloadEnvelope,
+    state: &ClientState,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
@@ -1086,9 +1104,10 @@ async fn connect_via_proxy(
         }
         head.push(byte[0]);
         if head.len() > 8192 {
-            return Err(format!(
-                "[NetworkError] ws proxy {proxy} sent an oversized CONNECT reply"
-            ));
+            let message =
+                format!("[ExchangeError] ws proxy {proxy} sent an oversized CONNECT reply");
+            state.fail_capacity(message.clone());
+            return Err(message);
         }
     }
     let status = String::from_utf8_lossy(&head);
@@ -1101,11 +1120,11 @@ async fn connect_via_proxy(
     let (ws, _resp) = tokio_tungstenite::client_async_tls_with_config(
         url,
         stream,
-        Some(socket_config(envelope)),
+        Some(socket_config(state.payload_envelope)),
         None,
     )
     .await
-    .map_err(|e| format!("[NetworkError] ws connect {url} via {proxy}: {e}"))?;
+    .map_err(|e| state.connect_failure(&format!("ws connect {url} via {proxy}"), &e))?;
     Ok(ws)
 }
 
@@ -1137,7 +1156,7 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
     let envelope = state.payload_envelope;
     let connect = async {
         match proxy.as_deref().filter(|p| !p.is_empty()) {
-            Some(p) => connect_via_proxy(url, p, envelope).await,
+            Some(p) => connect_via_proxy(url, p, &state).await,
             None => tokio_tungstenite::connect_async_with_config(
                 url,
                 Some(socket_config(envelope)),
@@ -1145,7 +1164,7 @@ pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<Clien
             )
             .await
             .map(|(ws, _)| ws)
-            .map_err(|e| format!("[NetworkError] ws connect: {e}")),
+            .map_err(|e| state.connect_failure("ws connect", &e)),
         }
     };
     let ws = tokio::select! {
