@@ -1286,110 +1286,13 @@ pub trait TypedExchangeExt: TypedExchange {
 }
 impl<T: TypedExchange + ?Sized> TypedExchangeExt for T {}
 
-pub use crate::exchanges::alpaca_typed::Alpaca;
-pub use crate::exchanges::apex_typed::Apex;
-pub use crate::exchanges::aster_typed::Aster;
-pub use crate::exchanges::backpack_typed::Backpack;
-pub use crate::exchanges::bequant_typed::Bequant;
-pub use crate::exchanges::bigone_typed::Bigone;
 pub use crate::exchanges::binance_typed::Binance;
-pub use crate::exchanges::binancecoinm_typed::Binancecoinm;
-pub use crate::exchanges::binanceus_typed::Binanceus;
 pub use crate::exchanges::binanceusdm_typed::Binanceusdm;
-pub use crate::exchanges::bingx_typed::Bingx;
-pub use crate::exchanges::bit2c_typed::Bit2c;
-pub use crate::exchanges::bitbank_typed::Bitbank;
-pub use crate::exchanges::bitbns_typed::Bitbns;
-pub use crate::exchanges::bitfinex_typed::Bitfinex;
-pub use crate::exchanges::bitflyer_typed::Bitflyer;
 pub use crate::exchanges::bitget_typed::Bitget;
-pub use crate::exchanges::bithumb_typed::Bithumb;
-pub use crate::exchanges::bitmex_typed::Bitmex;
-pub use crate::exchanges::bitopro_typed::Bitopro;
-pub use crate::exchanges::bitrue_typed::Bitrue;
-pub use crate::exchanges::bitso_typed::Bitso;
-pub use crate::exchanges::bitstamp_typed::Bitstamp;
-pub use crate::exchanges::bitteam_typed::Bitteam;
-pub use crate::exchanges::bittrade_typed::Bittrade;
-pub use crate::exchanges::bitvavo_typed::Bitvavo;
-pub use crate::exchanges::blockchaincom_typed::Blockchaincom;
-pub use crate::exchanges::blofin_typed::Blofin;
-pub use crate::exchanges::btcbox_typed::Btcbox;
-pub use crate::exchanges::btcmarkets_typed::Btcmarkets;
-pub use crate::exchanges::btcturk_typed::Btcturk;
-pub use crate::exchanges::btse_typed::Btse;
-pub use crate::exchanges::bullish_typed::Bullish;
 pub use crate::exchanges::bybit_typed::Bybit;
-pub use crate::exchanges::bybiteu_typed::Bybiteu;
-pub use crate::exchanges::bydfi_typed::Bydfi;
-pub use crate::exchanges::cex_typed::Cex;
-pub use crate::exchanges::coinbase_typed::Coinbase;
-pub use crate::exchanges::coinbaseexchange_typed::Coinbaseexchange;
-pub use crate::exchanges::coinbaseinternational_typed::Coinbaseinternational;
-pub use crate::exchanges::coincheck_typed::Coincheck;
-pub use crate::exchanges::coinex_typed::Coinex;
-pub use crate::exchanges::coinmate_typed::Coinmate;
-pub use crate::exchanges::coinone_typed::Coinone;
-pub use crate::exchanges::coinsph_typed::Coinsph;
-pub use crate::exchanges::coinspot_typed::Coinspot;
-pub use crate::exchanges::cryptocom_typed::Cryptocom;
-pub use crate::exchanges::cryptomus_typed::Cryptomus;
-pub use crate::exchanges::deepcoin_typed::Deepcoin;
-pub use crate::exchanges::delta_typed::Delta;
-pub use crate::exchanges::deribit_typed::Deribit;
-pub use crate::exchanges::derive_typed::Derive;
-pub use crate::exchanges::digifinex_typed::Digifinex;
-pub use crate::exchanges::dydx_typed::Dydx;
-pub use crate::exchanges::extended_typed::Extended;
-pub use crate::exchanges::fmfwio_typed::Fmfwio;
-pub use crate::exchanges::foxbit_typed::Foxbit;
 pub use crate::exchanges::gate_typed::Gate;
-pub use crate::exchanges::gateeu_typed::Gateeu;
-pub use crate::exchanges::gemini_typed::Gemini;
-pub use crate::exchanges::grvt_typed::Grvt;
-pub use crate::exchanges::hashkey_typed::Hashkey;
-pub use crate::exchanges::hibachi_typed::Hibachi;
-pub use crate::exchanges::hitbtc_typed::Hitbtc;
-pub use crate::exchanges::hollaex_typed::Hollaex;
-pub use crate::exchanges::htx_typed::Htx;
 pub use crate::exchanges::hyperliquid_typed::Hyperliquid;
-pub use crate::exchanges::independentreserve_typed::Independentreserve;
-pub use crate::exchanges::indodax_typed::Indodax;
-pub use crate::exchanges::kraken_typed::Kraken;
-pub use crate::exchanges::krakenfutures_typed::Krakenfutures;
-pub use crate::exchanges::kucoin_typed::Kucoin;
-pub use crate::exchanges::kucoinfutures_typed::Kucoinfutures;
-pub use crate::exchanges::latoken_typed::Latoken;
-pub use crate::exchanges::lbank_typed::Lbank;
-pub use crate::exchanges::lighter_typed::Lighter;
-pub use crate::exchanges::luno_typed::Luno;
-pub use crate::exchanges::mercado_typed::Mercado;
-pub use crate::exchanges::mexc_typed::Mexc;
-pub use crate::exchanges::modetrade_typed::Modetrade;
-pub use crate::exchanges::mudrex_typed::Mudrex;
-pub use crate::exchanges::myokx_typed::Myokx;
-pub use crate::exchanges::nado_typed::Nado;
-pub use crate::exchanges::ndax_typed::Ndax;
 pub use crate::exchanges::okx_typed::Okx;
-pub use crate::exchanges::okxus_typed::Okxus;
-pub use crate::exchanges::onetrading_typed::Onetrading;
-pub use crate::exchanges::p2b_typed::P2b;
-pub use crate::exchanges::pacifica_typed::Pacifica;
-pub use crate::exchanges::paradex_typed::Paradex;
-pub use crate::exchanges::paymium_typed::Paymium;
-pub use crate::exchanges::phemex_typed::Phemex;
-pub use crate::exchanges::poloniex_typed::Poloniex;
-pub use crate::exchanges::revolutx_typed::Revolutx;
-pub use crate::exchanges::tokocrypto_typed::Tokocrypto;
-pub use crate::exchanges::toobit_typed::Toobit;
-pub use crate::exchanges::upbit_typed::Upbit;
-pub use crate::exchanges::weex_typed::Weex;
-pub use crate::exchanges::whitebit_typed::Whitebit;
-pub use crate::exchanges::woo_typed::Woo;
-pub use crate::exchanges::woofipro_typed::Woofipro;
-pub use crate::exchanges::xt_typed::Xt;
-pub use crate::exchanges::zaif_typed::Zaif;
-pub use crate::exchanges::zebpay_typed::Zebpay;
 
 /// Construct a boxed typed wrapper by exchange id — the typed analog of
 /// picking an exchange at runtime. `config` is the same optional settings
@@ -1397,110 +1300,13 @@ pub use crate::exchanges::zebpay_typed::Zebpay;
 /// for an unknown id.
 pub fn from_id(id: &str, config: Option<crate::Value>) -> Option<Box<dyn TypedExchange>> {
     match id {
-        "alpaca" => Some(Box::new(Alpaca::new(config))),
-        "apex" => Some(Box::new(Apex::new(config))),
-        "aster" => Some(Box::new(Aster::new(config))),
-        "backpack" => Some(Box::new(Backpack::new(config))),
-        "bequant" => Some(Box::new(Bequant::new(config))),
-        "bigone" => Some(Box::new(Bigone::new(config))),
         "binance" => Some(Box::new(Binance::new(config))),
-        "binancecoinm" => Some(Box::new(Binancecoinm::new(config))),
-        "binanceus" => Some(Box::new(Binanceus::new(config))),
         "binanceusdm" => Some(Box::new(Binanceusdm::new(config))),
-        "bingx" => Some(Box::new(Bingx::new(config))),
-        "bit2c" => Some(Box::new(Bit2c::new(config))),
-        "bitbank" => Some(Box::new(Bitbank::new(config))),
-        "bitbns" => Some(Box::new(Bitbns::new(config))),
-        "bitfinex" => Some(Box::new(Bitfinex::new(config))),
-        "bitflyer" => Some(Box::new(Bitflyer::new(config))),
         "bitget" => Some(Box::new(Bitget::new(config))),
-        "bithumb" => Some(Box::new(Bithumb::new(config))),
-        "bitmex" => Some(Box::new(Bitmex::new(config))),
-        "bitopro" => Some(Box::new(Bitopro::new(config))),
-        "bitrue" => Some(Box::new(Bitrue::new(config))),
-        "bitso" => Some(Box::new(Bitso::new(config))),
-        "bitstamp" => Some(Box::new(Bitstamp::new(config))),
-        "bitteam" => Some(Box::new(Bitteam::new(config))),
-        "bittrade" => Some(Box::new(Bittrade::new(config))),
-        "bitvavo" => Some(Box::new(Bitvavo::new(config))),
-        "blockchaincom" => Some(Box::new(Blockchaincom::new(config))),
-        "blofin" => Some(Box::new(Blofin::new(config))),
-        "btcbox" => Some(Box::new(Btcbox::new(config))),
-        "btcmarkets" => Some(Box::new(Btcmarkets::new(config))),
-        "btcturk" => Some(Box::new(Btcturk::new(config))),
-        "btse" => Some(Box::new(Btse::new(config))),
-        "bullish" => Some(Box::new(Bullish::new(config))),
         "bybit" => Some(Box::new(Bybit::new(config))),
-        "bybiteu" => Some(Box::new(Bybiteu::new(config))),
-        "bydfi" => Some(Box::new(Bydfi::new(config))),
-        "cex" => Some(Box::new(Cex::new(config))),
-        "coinbase" => Some(Box::new(Coinbase::new(config))),
-        "coinbaseexchange" => Some(Box::new(Coinbaseexchange::new(config))),
-        "coinbaseinternational" => Some(Box::new(Coinbaseinternational::new(config))),
-        "coincheck" => Some(Box::new(Coincheck::new(config))),
-        "coinex" => Some(Box::new(Coinex::new(config))),
-        "coinmate" => Some(Box::new(Coinmate::new(config))),
-        "coinone" => Some(Box::new(Coinone::new(config))),
-        "coinsph" => Some(Box::new(Coinsph::new(config))),
-        "coinspot" => Some(Box::new(Coinspot::new(config))),
-        "cryptocom" => Some(Box::new(Cryptocom::new(config))),
-        "cryptomus" => Some(Box::new(Cryptomus::new(config))),
-        "deepcoin" => Some(Box::new(Deepcoin::new(config))),
-        "delta" => Some(Box::new(Delta::new(config))),
-        "deribit" => Some(Box::new(Deribit::new(config))),
-        "derive" => Some(Box::new(Derive::new(config))),
-        "digifinex" => Some(Box::new(Digifinex::new(config))),
-        "dydx" => Some(Box::new(Dydx::new(config))),
-        "extended" => Some(Box::new(Extended::new(config))),
-        "fmfwio" => Some(Box::new(Fmfwio::new(config))),
-        "foxbit" => Some(Box::new(Foxbit::new(config))),
         "gate" => Some(Box::new(Gate::new(config))),
-        "gateeu" => Some(Box::new(Gateeu::new(config))),
-        "gemini" => Some(Box::new(Gemini::new(config))),
-        "grvt" => Some(Box::new(Grvt::new(config))),
-        "hashkey" => Some(Box::new(Hashkey::new(config))),
-        "hibachi" => Some(Box::new(Hibachi::new(config))),
-        "hitbtc" => Some(Box::new(Hitbtc::new(config))),
-        "hollaex" => Some(Box::new(Hollaex::new(config))),
-        "htx" => Some(Box::new(Htx::new(config))),
         "hyperliquid" => Some(Box::new(Hyperliquid::new(config))),
-        "independentreserve" => Some(Box::new(Independentreserve::new(config))),
-        "indodax" => Some(Box::new(Indodax::new(config))),
-        "kraken" => Some(Box::new(Kraken::new(config))),
-        "krakenfutures" => Some(Box::new(Krakenfutures::new(config))),
-        "kucoin" => Some(Box::new(Kucoin::new(config))),
-        "kucoinfutures" => Some(Box::new(Kucoinfutures::new(config))),
-        "latoken" => Some(Box::new(Latoken::new(config))),
-        "lbank" => Some(Box::new(Lbank::new(config))),
-        "lighter" => Some(Box::new(Lighter::new(config))),
-        "luno" => Some(Box::new(Luno::new(config))),
-        "mercado" => Some(Box::new(Mercado::new(config))),
-        "mexc" => Some(Box::new(Mexc::new(config))),
-        "modetrade" => Some(Box::new(Modetrade::new(config))),
-        "mudrex" => Some(Box::new(Mudrex::new(config))),
-        "myokx" => Some(Box::new(Myokx::new(config))),
-        "nado" => Some(Box::new(Nado::new(config))),
-        "ndax" => Some(Box::new(Ndax::new(config))),
         "okx" => Some(Box::new(Okx::new(config))),
-        "okxus" => Some(Box::new(Okxus::new(config))),
-        "onetrading" => Some(Box::new(Onetrading::new(config))),
-        "p2b" => Some(Box::new(P2b::new(config))),
-        "pacifica" => Some(Box::new(Pacifica::new(config))),
-        "paradex" => Some(Box::new(Paradex::new(config))),
-        "paymium" => Some(Box::new(Paymium::new(config))),
-        "phemex" => Some(Box::new(Phemex::new(config))),
-        "poloniex" => Some(Box::new(Poloniex::new(config))),
-        "revolutx" => Some(Box::new(Revolutx::new(config))),
-        "tokocrypto" => Some(Box::new(Tokocrypto::new(config))),
-        "toobit" => Some(Box::new(Toobit::new(config))),
-        "upbit" => Some(Box::new(Upbit::new(config))),
-        "weex" => Some(Box::new(Weex::new(config))),
-        "whitebit" => Some(Box::new(Whitebit::new(config))),
-        "woo" => Some(Box::new(Woo::new(config))),
-        "woofipro" => Some(Box::new(Woofipro::new(config))),
-        "xt" => Some(Box::new(Xt::new(config))),
-        "zaif" => Some(Box::new(Zaif::new(config))),
-        "zebpay" => Some(Box::new(Zebpay::new(config))),
         _ => None,
     }
 }
