@@ -13,6 +13,7 @@ const MAX_SCOPE_CLIENTS: usize = 256;
 
 struct ScopeInner {
     id: u64,
+    raw_handoff: Option<mpsc::Sender<RawFrame>>,
     state: Mutex<ScopeState>,
 }
 struct ScopeState {
@@ -40,9 +41,21 @@ impl Default for ClientScope {
 impl ClientScope {
     /// Create an isolated, initially empty owner (at most 256 generations).
     pub fn new() -> Self {
+        Self::with_handoff(None)
+    }
+    /// Opt in to one isolated 256-frame raw FIFO for this owner. The real reader
+    /// applies bounded backpressure; a one-second stall or receiver loss is a
+    /// terminal failure. Default broadcast observation remains unchanged.
+    /// Construct and retain the receiver before starting any watch future.
+    pub fn new_with_raw_handoff() -> (Self, mpsc::Receiver<RawFrame>) {
+        let (sender, receiver) = mpsc::channel(RAW_ALL_CAPACITY);
+        (Self::with_handoff(Some(sender)), receiver)
+    }
+    fn with_handoff(raw_handoff: Option<mpsc::Sender<RawFrame>>) -> Self {
         Self {
             inner: Arc::new(ScopeInner {
                 id: NEXT_SCOPE.fetch_add(1, Ordering::Relaxed),
+                raw_handoff,
                 state: Mutex::new(ScopeState {
                     closed: false,
                     clients: Vec::new(),
@@ -304,7 +317,7 @@ fn acquire_in_scope(
             envelope
         }
     };
-    let client = new_slot(url, scope.id, envelope);
+    let client = new_slot(url, scope.id, envelope, scope.raw_handoff.clone());
     owner.clients.push(client.clone());
     registry.insert(url.to_owned(), client.clone());
     Ok(client)
@@ -334,7 +347,7 @@ fn acquire_unscoped(url: &str) -> Result<Arc<ClientState>, String> {
     if registry.len() >= 1024 && !registry.contains_key(url) {
         return Err("WebSocket registry limit".to_owned());
     }
-    let client = new_slot(url, 0, PayloadEnvelope::Default);
+    let client = new_slot(url, 0, PayloadEnvelope::Default, None);
     registry.insert(url.to_owned(), client.clone());
     Ok(client)
 }
@@ -374,10 +387,22 @@ impl ClientState {
         self.fail_with_source(ScopeFailureSource::Internal, message);
     }
     pub(super) fn fail_with_source(&self, source: ScopeFailureSource, message: String) {
+        self.record_failure(source, message, false);
+    }
+    /// Admission failure is meaningful only while this generation is open.
+    /// Serialize that decision with request_close's tasks -> closed lock order;
+    /// a separate is_closed check would race intentional scope cancellation.
+    pub(super) fn fail_raw_handoff(&self, message: String) {
+        self.record_failure(ScopeFailureSource::Internal, message, true);
+    }
+    fn record_failure(&self, source: ScopeFailureSource, message: String, only_if_open: bool) {
         {
             // Atomic first-terminal + fatal-retention decision. No path holds
             // error while acquiring tasks; release both before request_close.
             let mut tasks = self.tasks.lock().unwrap();
+            if only_if_open && self.is_closed() {
+                return;
+            }
             let mut terminal = self.error.lock().unwrap();
             let failure = ScopeFailure { source, message };
             if let Some(first) = terminal.as_ref() {
