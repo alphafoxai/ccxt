@@ -676,21 +676,26 @@ impl ClientState {
         true
     }
 
-    /// Await the next inbound message. `None` once the socket is closed and
-    /// the backlog is drained. Uses the create-future-before-check pattern so
-    /// a resolve/push racing the await is never lost.
-    pub async fn next_message(&self) -> Option<Value> {
+    /// Await the next inbound message. `Ok(None)` once the socket is closed
+    /// and the backlog is drained; `Err` carries the first terminal
+    /// transport/budget failure verbatim (the `terminal_error()` text), ahead
+    /// of any backlog. A terminal socket is an expected outcome, not a Rust
+    /// invariant violation, so it is returned rather than panicked; the watch
+    /// drive loops raise it through the transpiled exception convention.
+    /// Uses the create-future-before-check pattern so a resolve/push racing
+    /// the await is never lost.
+    pub async fn next_message(&self) -> Result<Option<Value>, String> {
         let mock = *self.mock.lock().unwrap();
         loop {
             let notified = self.notify.notified();
             if let Some(error) = self.terminal_error() {
-                panic!("{error}");
+                return Err(error);
             }
             if let Some(v) = self.incoming.lock().unwrap().pop() {
-                return Some(v);
+                return Ok(Some(v));
             }
             if *self.closed.lock().unwrap() {
-                return None;
+                return Ok(None);
             }
             if mock {
                 // Static WS test: the mock queue is fed by the frame injector.
@@ -701,7 +706,7 @@ impl ClientState {
                     .await
                     .is_err()
                 {
-                    return None;
+                    return Ok(None);
                 }
             } else {
                 notified.await;
@@ -1216,6 +1221,20 @@ fn socket_config(
         max_write_buffer_size: OUTGOING_BYTES,
         ..Default::default()
     }
+}
+
+/// Raise an expected terminal WebSocket outcome (`"[Kind] message"`) through
+/// the transpiled exception convention without reporting it as a Rust panic.
+///
+/// Transpiled `watch*` bodies return `Value`, and their errors travel as an
+/// unwind whose `String` payload `call_typed` / `panic_to_value` turn back into
+/// a typed error. `panic!` would also run the panic hook, so every socket reset
+/// printed `thread '…' panicked at` on a worker. `resume_unwind` carries the
+/// same `String` payload — callers observe identical text and kind — but never
+/// invokes the hook. It still unwinds: a caller without a `catch_unwind`
+/// boundary sees a failed task, exactly as before.
+pub fn raise_terminal(message: String) -> ! {
+    std::panic::resume_unwind(Box::new(message))
 }
 
 pub async fn ensure_client(url: &str, proxy: Option<String>) -> Result<Arc<ClientState>, String> {
@@ -1804,7 +1823,11 @@ mod tests {
         // "ticker" hash, and collect the resolved values.
         let mut lasts = Vec::new();
         while lasts.len() < 3 {
-            let msg = client.next_message().await.expect("message before close");
+            let msg = client
+                .next_message()
+                .await
+                .unwrap()
+                .expect("message before close");
             let last = crate::get_value(&msg, &Value::Str("last".to_string()));
             if let Value::Str(s) = &last {
                 client.resolve("ticker", Value::Str(s.clone()));
@@ -1999,9 +2022,7 @@ mod tests {
         let mut delivered = 0;
         let mut last_sequence = 0;
         loop {
-            let next = std::panic::AssertUnwindSafe(client.next_message())
-                .catch_unwind()
-                .await;
+            let next = client.next_message().await;
             let message = match next {
                 Ok(Some(message)) => message,
                 Ok(None) | Err(_) => break,
@@ -2096,12 +2117,11 @@ mod tests {
         );
         assert!(client.is_closed());
         // Not a successful empty result for a caller that shows up late.
-        let late = std::panic::AssertUnwindSafe(client.next_message())
-            .catch_unwind()
-            .await;
-        assert!(
-            late.is_err(),
-            "late consumer must observe the terminal cause"
+        let late = client.next_message().await;
+        assert_eq!(
+            late.unwrap_err(),
+            terminal,
+            "late consumer must observe the terminal cause verbatim"
         );
         let report = scope
             .close_and_join(std::time::Duration::from_secs(10))

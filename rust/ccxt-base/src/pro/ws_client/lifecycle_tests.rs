@@ -427,10 +427,10 @@ async fn incoming_overflow_is_not_successful_empty() {
     }
     assert!(client.is_closed());
     assert!(client.terminal_error().unwrap().contains("capacity"));
-    assert!(AssertUnwindSafe(client.next_message())
-        .catch_unwind()
-        .await
-        .is_err());
+    assert_eq!(
+        client.next_message().await.unwrap_err(),
+        client.terminal_error().unwrap()
+    );
     let overflow = scope.close_and_join(BOUND).await;
     assert!(!overflow.all_joined());
     assert!(overflow.cleanup_complete, "{overflow:?}");
@@ -462,7 +462,7 @@ async fn raw_overflow_reports_lag_and_payload_cap_is_not_bypassed() {
     let mut raw = subscribe_raw(url);
     for _ in 0..=RAW_BUS_CAPACITY {
         client.mock_inject_raw(b"pong".to_vec(), false);
-        assert!(client.next_message().await.is_some());
+        assert!(client.next_message().await.unwrap().is_some());
     }
     assert_eq!(raw_overflow_count(url), 1);
     assert!(matches!(
@@ -499,12 +499,9 @@ async fn socket_rejects_fragmented_aggregate_over_wire_limit() {
     });
     let scope = ClientScope::new();
     let client = scope.run(ensure_client(&url, None)).await.unwrap();
-    let result = tokio::time::timeout(
-        BOUND,
-        AssertUnwindSafe(client.next_message()).catch_unwind(),
-    )
-    .await
-    .unwrap();
+    let result = tokio::time::timeout(BOUND, client.next_message())
+        .await
+        .unwrap();
     assert!(
         result.is_err(),
         "oversized aggregate must fail, not be queued"

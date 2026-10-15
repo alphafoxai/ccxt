@@ -74,6 +74,9 @@ pub async fn with_raw_owner_drain<F: std::future::Future>(future: F) -> F::Outpu
 #[cfg(test)]
 #[path = "exchange/raw_owner_tests.rs"]
 mod raw_owner_tests;
+#[cfg(test)]
+#[path = "exchange/ws_terminal_tests.rs"]
+mod ws_terminal_tests;
 
 /// Snapshot + reset the global HTTP/JSON timings. Returns
 /// `(http_nanos, json_nanos, http_calls)` and zeroes them.
@@ -1283,8 +1286,12 @@ pub trait ExchangeRuntime: crate::exchange_generated::ExchangeBase {
                         }
                     },
                     received = client.next_message() => match received {
-                        Some(_) => {}
-                        None => panic!("[NetworkError] {} websocket connection closed", url),
+                        Ok(Some(_)) => {}
+                        Ok(None) => crate::pro::ws_client::raise_terminal(format!(
+                            "[NetworkError] {} websocket connection closed",
+                            url
+                        )),
+                        Err(error) => crate::pro::ws_client::raise_terminal(error),
                     },
                 }
             }
@@ -1383,8 +1390,12 @@ pub trait ExchangeRuntime: crate::exchange_generated::ExchangeBase {
                 None => client.next_message().await,
             };
             let msg = match received {
-                Some(m) => m,
-                None => panic!("[NetworkError] {} websocket connection closed", url),
+                Ok(Some(m)) => m,
+                Ok(None) => crate::pro::ws_client::raise_terminal(format!(
+                    "[NetworkError] {} websocket connection closed",
+                    url
+                )),
+                Err(error) => crate::pro::ws_client::raise_terminal(error),
             };
             if std::env::var("CCXT_WS_DEBUG").is_ok() {
                 let n: usize = std::env::var("CCXT_WS_DEBUG").ok()
