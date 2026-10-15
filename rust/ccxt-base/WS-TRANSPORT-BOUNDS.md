@@ -49,6 +49,17 @@ retained in `Tasks.failures`; actual non-cancelled JoinErrors are always appende
 per-error audit. Record locking is tasks → error; both are released before cancellation.
 Consumers must inspect every failure independently of cleanup proof.
 
+`ClientState::next_message()` returns `Result<Option<Value>, String>`: `Err` is that
+first terminal message verbatim (it wins over any backlog), `Ok(None)` a drained normal
+close. It never panics. The watch drive loops (`ws_drive_loop` and the raw-owner drain
+branch) re-raise `Err` text, and the `[NetworkError] <url> websocket connection closed`
+text for `Ok(None)`, through `ws_client::raise_terminal`: a `resume_unwind` with the same
+`String` payload. Transpiled `watch*` functions return `Value`, so the unwind remains
+their exception channel and `call_typed` yields the identical `[Kind] message` error;
+what changes is that `resume_unwind` skips the panic hook, so a socket reset no longer
+prints a `thread '…' panicked at` line on a worker. Without a `catch_unwind`
+boundary the task still fails as before.
+
 `request_close`, `drop_client`, and scope Drop only request cancellation. They must
 not be presented as join proof. Join handles remain inside `ClientState` across
 cancelled/timed-out join futures, so a retained scope/client can retry. Dropping the

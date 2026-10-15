@@ -92,12 +92,9 @@ async fn physical(envelope: PayloadEnvelope, reply: Reply, expected_bytes: Optio
     assert_eq!(admitted.generation(), client.generation());
     assert_eq!(client.payload_envelope(), envelope);
     assert!(client.send_text("subscribe".into()));
-    let result = tokio::time::timeout(
-        BOUND,
-        AssertUnwindSafe(client.next_message()).catch_unwind(),
-    )
-    .await
-    .unwrap();
+    let result = tokio::time::timeout(BOUND, client.next_message())
+        .await
+        .unwrap();
     if let Some(size) = expected_bytes {
         let value = result
             .expect("accepted envelope must not throw")
@@ -268,7 +265,7 @@ async fn scoped_ring_retention_is_bounded_and_overwrite_is_explicit() {
     let frames = RAW_ALL_CAPACITY + RAW_BUS_CAPACITY + 1;
     for _ in 0..frames {
         client.receive_payload(bytes.clone(), false);
-        let decoded = client.next_message().await.unwrap();
+        let decoded = client.next_message().await.unwrap().unwrap();
         assert_eq!(
             decoded.as_str().map(str::len),
             Some(SCOPED_MAX_PAYLOAD_BYTES)
